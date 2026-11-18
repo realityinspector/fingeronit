@@ -1,0 +1,176 @@
+#!/bin/bash
+# Move fingeronit's open door out of your user's reach. Run it yourself:
+#
+#   sudo bin/install-keeper            install or update
+#   sudo bin/install-keeper --remove   take it all back out
+#
+# What it makes:
+#   _fingeronit                       a hidden user with no shell and no password
+#   /usr/local/libexec/fingeronit/    keeper, hey, seal, and gmail.py (when present), owned by root
+#   /private/var/fingeronit/          where an open login sits, readable by _fingeronit only
+#   /etc/sudoers.d/fingeronit         one rule: you may run the keeper as _fingeronit
+#
+# On a fresh clone, run bin/build first: it makes libexec/hey and bin/finger-seal.
+#
+# The keeper only runs hey (or gmail.py) for a caller that holds the open door's ticket, from
+# the terminal that opened it. Anything else running as you can ask it to
+# close, but cannot read the login or use it.
+set -euo pipefail
+umask 022
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+SYS=/usr/local/libexec/fingeronit
+STATE=/private/var/fingeronit
+RULE=/etc/sudoers.d/fingeronit
+NAME=_fingeronit
+
+say() { printf '%s\n' "$1"; }
+die() { printf 'install-keeper: %s\n' "$1" >&2; exit 1; }
+
+[[ "$(id -u)" -eq 0 ]] || die "run it with sudo: sudo $0 ${1:-}"
+OWNER="${SUDO_USER:-}"
+[[ -n "$OWNER" && "$OWNER" != root ]] || die "run it with sudo from your own account, not as root"
+[[ "$OWNER" =~ ^[A-Za-z0-9._-]+$ ]] || die "unexpected user name"
+
+HERE="$(cd "$(dirname "$0")/.." && pwd -P)"
+
+user_exists() { dscl . -read "/Users/$NAME" UniqueID > /dev/null 2>&1; }
+group_exists() { dscl . -read "/Groups/$NAME" PrimaryGroupID > /dev/null 2>&1; }
+
+door_open() {
+  [[ -x "$SYS/keeper" ]] || return 1
+  [[ "$(sudo -u "$NAME" "$SYS/keeper" state 2>/dev/null || true)" == open* ]]
+}
+
+remove() {
+  if door_open; then
+    die "the keeper holds an open door. Quit fingeronit (it reseals) and run this again."
+  fi
+  rm -f "$RULE"
+  rm -rf "$SYS"
+  if [[ -d "$STATE" ]]; then
+    find "$STATE" -type f -exec dd if=/dev/urandom of={} bs=4096 count=1 conv=notrunc 2>/dev/null \; || true
+    rm -rf "$STATE"
+  fi
+  user_exists && dscl . -delete "/Users/$NAME"
+  group_exists && dscl . -delete "/Groups/$NAME"
+  say "Removed the keeper, its user, its folder, and the sudoers rule."
+  say "fingeronit goes back to keeping an open door under var/live, as you."
+}
+
+if [[ "${1:-}" == "--remove" ]]; then
+  remove
+  exit 0
+fi
+[[ -z "${1:-}" ]] || die "unknown option: $1"
+
+for f in lib/keeper libexec/hey bin/finger-seal lockenv.cfg; do
+  [[ -f "$HERE/$f" ]] || die "missing $HERE/$f. On a fresh clone, run bin/build first."
+done
+want="$(awk -F' *= *' '$1 == "binary_sha256" {print $2}' "$HERE/lockenv.cfg")"
+got="$(shasum -a 256 "$HERE/libexec/hey" | cut -d' ' -f1)"
+[[ -n "$want" && "$got" == "$want" ]] || die "libexec/hey does not match binary_sha256 in lockenv.cfg. Not installing it."
+grep -Eq '^#includedir /private/etc/sudoers.d|^@includedir /private/etc/sudoers.d|^#includedir /etc/sudoers.d|^@includedir /etc/sudoers.d' /etc/sudoers \
+  || die "/etc/sudoers does not read /etc/sudoers.d, so the rule would do nothing"
+
+# Refuse to install over an open door kept the old way, under var/live.
+if [[ -f "$HERE/var/live/keeper/door/ticket" ]]; then
+  die "fingeronit has a door open right now. Quit it (it reseals) and run this again."
+fi
+
+# Every folder from / down to the install folder must be root's and not
+# writable by anyone else, or someone could swap the keeper out.
+check_root_path() {
+  local p="$1" owner mode
+  while [[ -n "$p" && "$p" != "/" ]]; do
+    if [[ -e "$p" ]]; then
+      owner="$(stat -f %Su "$p")"
+      mode="$(stat -f %Lp "$p")"
+      [[ "$owner" == root ]] || die "$p is owned by $owner, not root"
+      (( (8#$mode & 8#022) == 0 )) || die "$p is writable by group or others ($mode)"
+    fi
+    p="$(dirname "$p")"
+  done
+}
+
+free_id() {
+  local id
+  for id in $(seq 480 499); do
+    if ! dscl . -list /Users UniqueID | awk '{print $2}' | grep -qx "$id" \
+      && ! dscl . -list /Groups PrimaryGroupID | awk '{print $2}' | grep -qx "$id"; then
+      printf '%s' "$id"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if ! group_exists || ! user_exists; then
+  id="$(free_id)" || die "no free system id between 480 and 499"
+  if ! group_exists; then
+    dscl . -create "/Groups/$NAME"
+    dscl . -create "/Groups/$NAME" PrimaryGroupID "$id"
+    dscl . -create "/Groups/$NAME" RealName "fingeronit keeper"
+    dscl . -create "/Groups/$NAME" Password '*'
+  fi
+  gid="$(dscl . -read "/Groups/$NAME" PrimaryGroupID | awk '{print $2}')"
+  if ! user_exists; then
+    dscl . -create "/Users/$NAME"
+    dscl . -create "/Users/$NAME" UniqueID "$id"
+    dscl . -create "/Users/$NAME" PrimaryGroupID "$gid"
+    dscl . -create "/Users/$NAME" UserShell /usr/bin/false
+    dscl . -create "/Users/$NAME" NFSHomeDirectory /var/empty
+    dscl . -create "/Users/$NAME" RealName "fingeronit keeper"
+    dscl . -create "/Users/$NAME" Password '*'
+    dscl . -create "/Users/$NAME" IsHidden 1
+  fi
+  say "Made the hidden user $NAME."
+fi
+
+mkdir -p /usr/local/libexec
+chown root:wheel /usr/local/libexec
+chmod 755 /usr/local/libexec
+install -d -o root -g wheel -m 755 "$SYS"
+check_root_path "$SYS"
+install -o root -g wheel -m 755 "$HERE/lib/keeper" "$SYS/keeper"
+install -o root -g wheel -m 755 "$HERE/libexec/hey" "$SYS/hey"
+install -o root -g wheel -m 755 "$HERE/bin/finger-seal" "$SYS/seal"
+if [[ -f "$HERE/lib/providers/gmail.py" ]]; then
+  install -o root -g wheel -m 644 "$HERE/lib/providers/gmail.py" "$SYS/gmail.py"
+else
+  rm -f "$SYS/gmail.py"
+  say "No lib/providers/gmail.py here, so the Gmail provider is not installed."
+fi
+[[ "$(shasum -a 256 "$SYS/hey" | cut -d' ' -f1)" == "$want" ]] || die "the copied hey does not match its checksum"
+say "Installed the keeper, hey, seal and any provider scripts in $SYS (root's)."
+
+install -d -o "$NAME" -g "$NAME" -m 700 "$STATE"
+say "Made $STATE, readable by $NAME only."
+
+tmp="$(mktemp /tmp/fingeronit-sudoers.XXXXXX)"
+cat > "$tmp" << EOF
+# fingeronit: $OWNER may run the fingeronit keeper as $NAME, and nothing else.
+# Remove with: sudo $HERE/bin/install-keeper --remove
+Defaults!$SYS/keeper !use_pty
+$OWNER ALL=($NAME) NOPASSWD: $SYS/keeper
+EOF
+if ! visudo -cf "$tmp" > /dev/null; then
+  rm -f "$tmp"
+  die "the sudoers rule did not check out. Nothing was changed in /etc/sudoers.d."
+fi
+install -o root -g wheel -m 440 "$tmp" "$RULE"
+rm -f "$tmp"
+visudo -c > /dev/null || { rm -f "$RULE"; die "sudoers failed its check with the rule in. The rule was removed."; }
+say "Added $RULE."
+
+say ""
+say "Self-test:"
+sudo -u "$NAME" "$SYS/keeper" selftest | sed 's/^/  /' || die "the keeper self-test failed"
+if sudo -u "$OWNER" sudo -n -u "$NAME" "$SYS/keeper" state > /dev/null; then
+  say "  $OWNER can reach the keeper without a password"
+else
+  die "$OWNER cannot reach the keeper through sudo"
+fi
+say ""
+say "Done. fingeronit now hands an open login to $NAME. Run fingeronit doctor to see it."
+say "After a HEY update or a fingeronit update, run this again to copy the new files in."

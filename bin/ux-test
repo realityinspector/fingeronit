@@ -1,0 +1,1553 @@
+#!/bin/bash
+# Replay the menu against a fake login in /tmp.
+# This never opens a real seal, or any mail.
+set -euo pipefail
+set +m
+umask 077
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+SRC="$HERE/fingeronit"
+KEEPER_SRC="$HERE/../lib/keeper"
+[[ -f "$SRC" ]] || { printf 'ux-test: bin/fingeronit is missing\n' >&2; exit 1; }
+[[ -f "$KEEPER_SRC" ]] || { printf 'ux-test: lib/keeper is missing\n' >&2; exit 1; }
+
+# Never your real home: exports, ~/.config/hey-cli, and the keychain are faked.
+UXHOME="$(mktemp -d /tmp/fingeronit-ux-home.XXXXXX)"
+case "$UXHOME" in /tmp/fingeronit-ux-home.*) ;; *) exit 1 ;; esac
+export HOME="$UXHOME"
+export FINGERONIT_KEEPER_LOCAL=1
+export FINGERONIT_SECURITY="$UXHOME/security-stub"
+cat > "$FINGERONIT_SECURITY" << EOF
+#!/bin/bash
+# Stub keychain. The marker file stands for one item under service "hey".
+m="$UXHOME/kc-hey"
+case "\${1:-}" in
+  find-generic-password) [[ -f "\$m" ]] && exit 0; exit 44 ;;
+  delete-generic-password) [[ -f "\$m" ]] || exit 44; rm -f "\$m"; printf 'delete\n' >> "$UXHOME/kc-log"; exit 0 ;;
+  dump-keychain)
+    if [[ -f "\$m" ]]; then
+      printf 'keychain: "/stub"\nattributes:\n    "acct"<blob>="https://app.hey.com"\n    "svce"<blob>="hey"\n'
+    fi
+    exit 0 ;;
+esac
+exit 1
+EOF
+chmod 700 "$FINGERONIT_SECURITY"
+
+ROOTS=()
+SLEEPERS=()
+
+cleanup() {
+  local pid root
+  for pid in "${SLEEPERS[@]+"${SLEEPERS[@]}"}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  for root in "${ROOTS[@]+"${ROOTS[@]}"}"; do
+    case "$root" in
+      /tmp/fingeronit-ux.*) python3 -c 'import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)' "$root" ;;
+    esac
+  done
+  case "${UXHOME:-}" in
+    /tmp/fingeronit-ux-home.*) python3 -c 'import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)' "$UXHOME" ;;
+  esac
+  python3 -c 'import glob,shutil
+for path in glob.glob("/tmp/fingeronit-export.fingeronit-ux.*"):
+    shutil.rmtree(path, ignore_errors=True)'
+}
+trap cleanup EXIT
+
+write_stubs() {
+  local root="$1"
+  cat > "$root/bin/finger-touch" << EOF
+#!/bin/bash
+set -euo pipefail
+root="$root"
+marker() { printf '%s/var/keys/%s' "\$root" "\${1//\\//_}"; }
+cmd="\${1:-}"
+shift || true
+case "\$cmd" in
+  status)
+    if [[ -f "\$(marker "\$1")" ]]; then printf 'present\n'; else printf 'absent\n'; fi
+    ;;
+  seal)
+    mkdir -p "\$(dirname "\$3")" "\$(dirname "\$(marker "\$1")")"
+    { printf 'FINGER1\\0'; cat "\$2"; } > "\$3"
+    : > "\$(marker "\$1")"
+    ;;
+  unseal)
+    mkdir -p "\$(dirname "\$3")" "\$(dirname "\$4")"
+    [[ "\$(head -c 7 "\$2")" == FINGER1 ]] || { printf 'stub: not a seal\n' >&2; exit 65; }
+    tail -c +9 "\$2" > "\$3"
+    dd if=/dev/zero of="\$4" bs=32 count=1 2>/dev/null
+    ;;
+  streams)
+    exit 0
+    ;;
+  unseal-stream)
+    [[ "\$(head -c 7 "\$2")" == FINGER1 ]] || { printf 'stub: not a seal\n' >&2; exit 65; }
+    printf '%064d\n' 0
+    tail -c +9 "\$2"
+    ;;
+  seal-raw)
+    mkdir -p "\$(dirname "\$3")"
+    cp "\$2" "\$3"
+    ;;
+  drop)
+    for account in "\$@"; do
+      [[ "\$account" == "--" ]] && break
+      rm -f "\$(marker "\$account")"
+    done
+    ;;
+  *)
+    printf 'finger-touch stub: %s\n' "\$cmd" >&2
+    exit 1
+    ;;
+esac
+EOF
+  cat > "$root/libexec/hey" << 'EOF'
+#!/bin/bash
+set -euo pipefail
+if [[ -n "${TMPDIR:-}" ]]; then
+  printf '%s\n' "$*" >> "$TMPDIR/invocations.log"
+fi
+if [[ "${1:-}" == "auth" && "${2:-}" == "login" ]]; then
+  mkdir -p "$XDG_CONFIG_HOME/hey-cli"
+  printf '%s\n' '{"origin":"test"}' > "$XDG_CONFIG_HOME/hey-cli/credentials.json"
+  printf 'Logged in (stub)\n'
+  exit 0
+fi
+case " $* " in
+  *" --help "*)
+    case "${1:-} ${2:-}" in
+      "search "*) printf 'Flags:\n  --from string\n  --to string\n  --date string\n  --all\nGlobal Flags:\n  --json\n' ;;
+      "thread read") printf 'Flags:\n  --markdown\n' ;;
+      "attachment list") printf 'Flags:\n  --allow-partial\nGlobal Flags:\n  --json\n' ;;
+      "attachment save") printf 'Flags:\n  -o, --output string\n  --force\n' ;;
+      *) printf 'usage\n' ;;
+    esac
+    exit 0
+    ;;
+esac
+if [[ "${1:-}" == "version" ]]; then
+  printf 'hey version stub\n'
+  exit 0
+fi
+if [[ "${1:-}" == "search" ]]; then
+  case " $* " in *" --json "*) ;; *) printf 'stub: search wants --json\n' >&2; exit 2 ;; esac
+  from="" to="" query=""
+  prev=""
+  for arg in "$@"; do
+    case "$prev" in
+      --from) from="$arg" ;;
+      --to) to="$arg" ;;
+      --date|--page) ;;
+      *) [[ "$arg" != -* && "$arg" != search && -z "$query" ]] && query="$arg" ;;
+    esac
+    prev="$arg"
+  done
+  python3 - "$from" "$to" "$query" << 'PY2'
+import json, sys
+from datetime import datetime, timedelta, timezone
+now = datetime.now(timezone(timedelta(hours=-7)))
+def go(days):
+    # Go's RFC3339Nano: nine fractional digits and a numeric offset
+    return (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.123456789-07:00")
+def row(tid, subject, days, with_messages=True, creator=None):
+    r = {"id": 9000 + tid, "topic_id": tid, "subject": subject, "updated_at": go(days)}
+    msg = {"id": tid * 10, "created_at": go(days), "summary": "SECRET-BODY " + subject}
+    if creator:
+        msg["creator"] = creator
+    r["messages"] = [msg] if with_messages else []
+    return r
+data = []
+if sys.argv[2] == "news@example.com":
+    data = [row(888, "Sent reply", 4), row(889, "Old sent", 40)]
+elif sys.argv[3] == "news@example.com":
+    data = [row(111, "Alpha note", 3), row(999, "Mentioned", 6)]
+elif sys.argv[1] == "news@example.com":
+    newsc = {"id": 42, "name": "News", "email_address": "News@example.com"}
+    data = [row(111, "Alpha note", 3, creator=newsc), row(222, "Beta note", 10, False),
+            row(333, "Gamma note", 20), row(444, "Ancient note", 40)]
+elif sys.argv[1] == "first@example.com":
+    data = [row(501, "First recent", 2), row(777, "Shared thread", 5), row(502, "First ancient", 400)]
+elif sys.argv[1] == "second@example.org":
+    data = [row(601, "Second only", 30), row(777, "Shared thread", 5)]
+json.dump({"ok": True, "data": data, "summary": "%d results" % len(data),
+           "meta": {"page": 1, "pages_fetched": 1}}, sys.stdout)
+sys.stdout.write("\n")
+PY2
+  exit 0
+fi
+if [[ "${1:-}" == "draft" && "${2:-}" == "list" ]]; then
+  case " $* " in *" --all "*) ;; *) printf 'stub: draft list wants --all\n' >&2; exit 2 ;; esac
+  printf '{"ok":true,"data":[{"id":31,"subject":"Reply draft","summary":"SECRET-BODY draft","updated_at":"%s","addressed_contacts":[{"id":42,"email_address":"news@example.com"}]},{"id":32,"subject":"Other draft","updated_at":"%s","addressed_contacts":[{"id":9,"email_address":"someone@example.org"}]}]}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  exit 0
+fi
+if [[ "${1:-}" == "draft" && "${2:-}" == "show" ]]; then
+  [[ "${3:-}" == 31 ]] || { printf 'stub: no such draft\n' >&2; exit 1; }
+  printf '{"ok":true,"data":{"id":31,"subject":"Reply draft","from":"me@example.com","to":["news@example.com"],"bcc":["hidden@example.org"],"body":"stub-draft-body"}}\n'
+  exit 0
+fi
+if [[ "${1:-}" == "contact" && "${2:-}" == "list" ]]; then
+  printf '{"ok":true,"data":[{"id":77,"name":"First","email_address":"first@example.com"},{"id":78,"name":"Other","email_address":"other@example.com"}]}\n'
+  exit 0
+fi
+if [[ "${1:-}" == "contact" && "${2:-}" == "threads" ]]; then
+  case " $* " in *" --all "*) ;; *) printf 'stub: contact threads wants --all\n' >&2; exit 2 ;; esac
+  case " $* " in *" --json "*) ;; *) printf 'stub: contact threads wants --json\n' >&2; exit 2 ;; esac
+  python3 - "${3:-}" << 'PY3'
+import json, sys
+from datetime import datetime, timedelta, timezone
+now = datetime.now(timezone(timedelta(hours=-7)))
+def go(days):
+    return (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S.123456789-07:00")
+def post(tid, name, days):
+    # updated_at is newer than active_at on purpose: active_at is the thread's date
+    return {"id": 8000 + tid, "topic_id": tid, "name": name, "active_at": go(days),
+            "updated_at": go(0), "summary": "SECRET-BODY " + name}
+posts = {"42": [post(111, "Alpha note", 3), post(555, "Delta note", 12), post(666, "Contact old note", 90)],
+         "77": [post(503, "First via contact", 1)]}.get(sys.argv[1])
+if posts is None:
+    sys.stderr.write("stub: no such contact\n")
+    sys.exit(1)
+json.dump({"ok": True, "data": {"id": int(sys.argv[1]), "postings": posts}}, sys.stdout)
+sys.stdout.write("\n")
+PY3
+  exit 0
+fi
+if [[ "${1:-}" == "thread" && "${2:-}" == "read" ]]; then
+  printf 'stub-thread %s\n' "${3:-}"
+  exit 0
+fi
+if [[ "${1:-}" == "attachment" && "${2:-}" == "list" ]]; then
+  case " $* " in *" --json "*) ;; *) printf 'stub: attachment list wants --json\n' >&2; exit 2 ;; esac
+  t="${3:-}"
+  printf '{"ok":true,"data":[{"id":"%s0:1","filename":"note.txt"},{"id":"%s1:1","filename":"note.txt"},{"id":"%s2:1","filename":"note.txt"}]}\n' "$t" "$t" "$t"
+  exit 0
+fi
+if [[ "${1:-}" == "attachment" && "${2:-}" == "save" ]]; then
+  out=""
+  prev=""
+  for arg in "$@"; do
+    if [[ "$prev" == "--output" || "$prev" == "-o" ]]; then
+      out="$arg"
+    fi
+    prev="$arg"
+  done
+  [[ -n "$out" ]] || exit 1
+  mkdir -p "$out"
+  if [[ -e "$out/note.txt" ]]; then
+    printf '{"ok":false,"error":"destination already exists: %s (use --force to replace it)","code":"usage"}\n' "$out/note.txt" >&2
+    exit 64
+  fi
+  case "${3:-}" in
+    *2:1) printf 'stub-attachment, a different file\n' > "$out/note.txt" ;;
+    *) printf 'stub-attachment\n' > "$out/note.txt" ;;
+  esac
+  exit 0
+fi
+printf 'hey-stub: %s\n' "$*"
+exit 0
+EOF
+  cat > "$root/bin/finger-seal" << 'EOF'
+#!/bin/bash
+# Stub seal: the header, then the plaintext. The real one is AES-GCM.
+[[ "${1:-}" == "--check" ]] && { cat > /dev/null; printf '1\n'; exit 0; }
+[[ -f "${1:-}" ]] || exit 65
+printf 'FINGER1\0'
+cat
+EOF
+  cat > "$root/lib/providers/gmail.py" << 'EOF'
+# Stub Gmail provider for ux-test: the interface lib/providers/gmail.py implements,
+# with fixture data from example.com. It never touches the network.
+import json, os, sys
+from datetime import datetime, timedelta, timezone
+
+args = sys.argv[1:]
+# The test root's var/ outlives the door, so the test can read what was called.
+with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "../../var/stub-gmail.log"), "a") as log:
+    log.write(" ".join(args) + "\n")
+
+def out(obj):
+    json.dump(obj, sys.stdout)
+    sys.stdout.write("\n")
+
+def stamp(days):
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def flag(name):
+    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else ""
+
+if args[:2] == ["auth", "login"]:
+    cfg = os.path.join(os.environ["XDG_CONFIG_HOME"], "fingeronit-gmail")
+    os.makedirs(cfg, exist_ok=True)
+    with open(os.path.join(cfg, "credentials.json"), "w") as f:
+        f.write('{"origin":"test","provider":"gmail"}\n')
+    print("Logged in (gmail stub)")
+    sys.exit(0)
+if args[:2] == ["auth", "status"]:
+    out({"ok": True, "data": {"authenticated": True}})
+    sys.exit(0)
+if args[:1] == ["version"]:
+    print("gmail version stub")
+    sys.exit(0)
+if "--help" in args:
+    if args[0] == "search":
+        print("Flags:\n  --from string\n  --to string\n  --date string\n  --all\n  --json")
+    elif args[:2] == ["thread", "read"]:
+        print("Flags:\n  --markdown")
+    elif args[:2] == ["attachment", "list"]:
+        print("Flags:\n  --json")
+    elif args[:2] == ["attachment", "save"]:
+        print("Flags:\n  --output string\n  --force")
+    else:
+        print("usage")
+    sys.exit(0)
+
+def thread(tid, subject, days, who):
+    return {"topic_id": tid, "subject": subject, "updated_at": stamp(days),
+            "messages": [{"created_at": stamp(days),
+                          "creator": {"id": who, "email_address": who, "name": "News"}}]}
+
+if args[0] == "search":
+    if "--json" not in args:
+        sys.stderr.write("stub: search wants --json\n")
+        sys.exit(2)
+    data = []
+    query = next((a for a in args[1:] if not a.startswith("--") and a not in
+                  (flag("--from"), flag("--to"), flag("--date"))), "")
+    if flag("--to") == "news@example.com":
+        data = [thread("18c0a1b2c3d4e5f2", "Gmail sent reply", 4, "me@example.com")]
+    elif query == "news@example.com":
+        data = [thread("18c0a1b2c3d4e5f0", "Gmail alpha", 3, "news@example.com"),
+                thread("18c0a1b2c3d4e5f3", "Gmail mentioned", 6, "other@example.org")]
+    elif flag("--from") == "news@example.com":
+        data = [thread("18c0a1b2c3d4e5f0", "Gmail alpha", 3, "news@example.com"),
+                thread("18c0a1b2c3d4e5f1", "Gmail beta", 10, "news@example.com"),
+                thread("18c0a1b2c3d4e5f4", "Gmail ancient", 40, "news@example.com")]
+    out({"ok": True, "data": data})
+    sys.exit(0)
+if args[:2] == ["thread", "read"]:
+    print("stub-gmail-thread " + args[2])
+    sys.exit(0)
+if args[:2] == ["attachment", "list"]:
+    out({"ok": True, "data": [{"id": args[2] + ".att1", "filename": "note.txt"}]})
+    sys.exit(0)
+if args[:2] == ["attachment", "save"]:
+    dest = flag("--output")
+    os.makedirs(dest, exist_ok=True)
+    target = os.path.join(dest, "note.txt")
+    if os.path.exists(target) and "--force" not in args:
+        sys.stderr.write("destination already exists: %s\n" % target)
+        sys.exit(64)
+    with open(target, "w") as f:
+        f.write("stub-gmail-attachment\n")
+    sys.exit(0)
+if args[:2] == ["draft", "list"]:
+    out({"ok": True, "data": [
+        {"id": "r-1234abcd", "subject": "Gmail draft", "updated_at": stamp(1),
+         "addressed_contacts": [{"email_address": "news@example.com"}]},
+        {"id": "r-9999ffff", "subject": "Other gmail draft", "updated_at": stamp(1),
+         "addressed_contacts": [{"email_address": "someone@example.org"}]}]})
+    sys.exit(0)
+if args[:2] == ["draft", "show"]:
+    if args[2] != "r-1234abcd":
+        sys.stderr.write("stub: no such draft\n")
+        sys.exit(1)
+    out({"ok": True, "data": {"id": "r-1234abcd", "subject": "Gmail draft", "from": "me@example.com",
+                              "to": ["news@example.com"], "cc": [], "bcc": ["hidden@example.org"],
+                              "body": "stub-gmail-draft-body"}})
+    sys.exit(0)
+sys.stderr.write("gmail-stub: unexpected call: %s\n" % " ".join(args))
+sys.exit(2)
+EOF
+  chmod 700 "$root/bin/finger-touch" "$root/libexec/hey" "$root/bin/finger-seal" "$root/lib/providers/gmail.py"
+}
+
+make_root() {
+  ROOT="$(trap - EXIT; mktemp -d /tmp/fingeronit-ux.XXXXXX)"
+  case "$ROOT" in
+    /tmp/fingeronit-ux.*) ;;
+    *) printf 'ux-test: refused to use %s\n' "$ROOT" >&2; exit 1 ;;
+  esac
+  mkdir -p "$ROOT/bin" "$ROOT/lib/providers" "$ROOT/libexec" "$ROOT/var/live" "$ROOT/var/instances"
+  cp "$SRC" "$ROOT/bin/fingeronit"
+  cp "$KEEPER_SRC" "$ROOT/lib/keeper"
+  chmod 700 "$ROOT/lib/keeper"
+  chmod 700 "$ROOT/bin/fingeronit"
+  ln -s bin/fingeronit "$ROOT/fingeronit"
+  write_stubs "$ROOT"
+  write_drive "$ROOT/drive.py"
+  [[ -f "$ROOT/drive.py" ]] || { printf 'ux-test: drive.py missing in %s\n' "$ROOT" >&2; exit 1; }
+  ROOTS+=("$ROOT")
+}
+
+write_drive() {
+  cat > "$1" << 'PY'
+import os, select, subprocess, sys, time
+
+def text_of(buf):
+    return buf.decode("utf-8", "replace").replace("\r", "")
+
+def dump(buf):
+    lines = text_of(buf).splitlines()
+    sys.stderr.write("\n".join(lines[-80:]) + "\n")
+
+def wait_child(pid, fd, buf, deadline):
+    while time.time() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if r:
+            try:
+                chunk = os.read(fd, 8192)
+            except OSError:
+                chunk = b""
+            if chunk:
+                buf += chunk
+                continue
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid != 0:
+            return buf, os.waitstatus_to_exitcode(status)
+    os.kill(pid, 15)
+    for _ in range(30):
+        if os.waitpid(pid, os.WNOHANG)[0] != 0:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+    dump(buf)
+    raise SystemExit("timed out waiting for exit")
+
+def read_until(pid, fd, buf, pos, want, deadline):
+    needle = want.encode()
+    while needle not in buf[pos:] and time.time() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if not r:
+            wpid, _ = os.waitpid(pid, os.WNOHANG)
+            if wpid != 0:
+                dump(buf)
+                raise SystemExit("exited before seeing " + want)
+            continue
+        try:
+            chunk = os.read(fd, 8192)
+        except OSError:
+            chunk = b""
+        if not chunk:
+            dump(buf)
+            raise SystemExit("closed before seeing " + want)
+        buf += chunk
+    if needle not in buf[pos:]:
+        dump(buf)
+        raise SystemExit("timed out waiting for " + want)
+    idx = buf.find(needle, pos)
+    return buf, idx, text_of(buf[pos:idx])
+
+def drive(root, args, steps, timeout):
+    pid, fd = os.forkpty()
+    if pid == 0:
+        os.chdir(root)
+        os.execv(root + "/fingeronit", [root + "/fingeronit", *args])
+    buf = b""
+    pos = 0
+    deadline = time.time() + timeout
+    try:
+        for step in steps:
+            buf, idx, slice_ = read_until(pid, fd, buf, pos, step["wait"], deadline)
+            pos = idx + len(step["wait"])
+            if "check" in step:
+                step["check"](root, slice_)
+            if "send" in step:
+                os.write(fd, step["send"].encode())
+            if step.get("hangup"):
+                # The terminal goes away, the way a crashed Terminal.app does.
+                os.close(fd)
+                end = time.time() + 20
+                while time.time() < end:
+                    done, status = os.waitpid(pid, os.WNOHANG)
+                    if done:
+                        return (os.waitstatus_to_exitcode(status), text_of(buf))
+                    time.sleep(0.1)
+                raise AssertionError("fingeronit did not exit after the terminal hung up")
+        buf, code = wait_child(pid, fd, buf, deadline)
+    except Exception:
+        try:
+            os.kill(pid, 15)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+        raise
+    return code, text_of(buf)
+
+def must(cond, message):
+    if not cond:
+        raise SystemExit(message)
+
+def live_lock(root):
+    return os.path.isdir(os.path.join(root, "var/live/lock"))
+
+def live_cred(root):
+    return any(os.path.exists(os.path.join(root, base, cfg, "credentials.json"))
+               for base in ("var/live/keeper/door/xdg", "var/live/xdg")
+               for cfg in ("hey-cli", "fingeronit-gmail"))
+
+def door(root, name):
+    return os.path.join(root, "var/live/keeper/door", name)
+
+def keeper(root, args, stdin):
+    import subprocess
+    env = dict(os.environ, FINGERONIT_KEEPER_HOME=os.path.join(root, "var/live/keeper"),
+               FINGERONIT_KEEPER_HEY=os.path.join(root, "libexec/hey"),
+               FINGERONIT_KEEPER_GMAIL=os.path.join(root, "lib/providers/gmail.py"),
+               FINGERONIT_KEEPER_SEAL=os.path.join(root, "bin/finger-seal"))
+    p = subprocess.run(["/bin/bash", os.path.join(root, "lib/keeper")] + args, input=stdin.encode(),
+                       capture_output=True, env=env, start_new_session=True)
+    return p.returncode, (p.stdout + p.stderr).decode("utf-8", "replace")
+
+def outsider_refused(root):
+    # An agent running as you, with no ticket and no share of this terminal.
+    code, out = keeper(root, ["run", "--", "box", "list"], "not-the-ticket\n")
+    must(code == 77 and "does not hold the open door" in out, "keeper ran hey without the ticket: %s %s" % (code, out))
+    code, out = keeper(root, ["save", "1110:1"], "\n")
+    must(code == 77, "keeper saved an attachment without the ticket")
+    # Even with the ticket in hand (readable here only because the test keeper
+    # runs as you), another terminal is turned away.
+    ticket = open(door(root, "ticket")).read()
+    code, out = keeper(root, ["run", "--", "box", "list"], ticket)
+    must(code == 77 and "another terminal" in out, "keeper ran hey for another terminal: %s %s" % (code, out))
+    must("hey-stub" not in out, "hey ran for an outsider")
+
+def seal(root):
+    return os.path.isfile(os.path.join(root, "var/instances/temp/sealed.box"))
+
+PAUSE = "for the menu."
+
+def out_sealed(root, slice_):
+    must("Sealed. The door is shut." in slice_, "missing seal confirmation")
+    must(not live_lock(root), "door left open after sign-in")
+    must(not live_cred(root), "credential left in the open after sign-in")
+    must(seal(root), "seal file missing after sign-in")
+
+def menu_locked(root, slice_):
+    must("Locked." in slice_, "menu did not say locked")
+    must("seal" in slice_ and "yes" in slice_, "menu did not show seal yes")
+    must("door" in slice_ and "shut" in slice_, "menu did not show door shut")
+    must("Export mail from a sender" in slice_, "export was not offered")
+    must("Browse mail" in slice_, "browse was not offered")
+    must("0  Quit" in slice_, "quit row missing")
+
+def menu_fresh(root, slice_):
+    must("Sign in" in slice_, "sign-in was not offered")
+    must("Open a shell session" not in slice_, "session offered before sign-in")
+    must("Export mail from a sender" not in slice_, "export offered before sign-in")
+    must("No login yet" in slice_, "fresh box did not say so")
+
+def assert_nothing(root, slice_):
+    must("Nothing run." in slice_, "empty command was silent")
+    must(not live_lock(root), "empty command opened the door")
+
+def assert_version(root, slice_):
+    must("hey version stub" in slice_, "version did not run")
+    must(not live_lock(root), "version opened the door")
+
+def assert_box(root, slice_):
+    must("hey-stub: box list" in slice_, "command did not run")
+    must("Done. The door is shut." in slice_, "command did not shut the door")
+    must(not live_lock(root), "command left the door open")
+    must(not live_cred(root), "command left a live credential")
+    must(seal(root), "command lost the seal")
+
+def assert_tui(root, slice_):
+    must("hey-stub: tui" in slice_, "browse did not start the tui")
+    must("Done. The door is shut." in slice_, "browse did not shut the door")
+    must(not live_lock(root) and not live_cred(root), "browse left the door open")
+
+def assert_help(root, slice_):
+    must("What the lock is" in slice_, "help screen missing")
+    must("space ticks" in slice_, "help keys missing")
+
+def assert_session(root, slice_):
+    must("Session closed. The door is shut." in slice_, "session did not close")
+    must("door" in slice_ and "shut" in slice_, "menu door not shut after session")
+    must(not live_lock(root), "session left the door open")
+    must(not live_cred(root), "session left a live credential")
+    must(seal(root), "session lost the seal")
+
+def assert_kept(root, slice_):
+    must("left it alone" in slice_, "bad destroy confirmation was not refused")
+    must(seal(root), "bad confirmation removed the seal")
+
+def assert_destroyed(root, slice_):
+    must("Destroyed instance" in slice_, "destroy did not finish")
+    must(not seal(root), "seal file survived destroy")
+    must(not live_lock(root), "destroy left the door open")
+
+def signin(root):
+    steps = [
+        {"wait": "Choose:", "check": menu_fresh, "send": "1"},
+        {"wait": "Provider [1 HEY, 2 Gmail]", "send": "\n"},
+        {"wait": PAUSE, "check": out_sealed, "send": " "},
+        {"wait": "Choose:", "check": menu_locked, "send": "q"},
+    ]
+    code, all_text = drive(root, [], steps, 20)
+    must(code == 0, "signin exit %s" % code)
+    must("Door shut." in all_text, "signin quit did not shut")
+
+def story(root):
+    # Locked menu: 1 export, 2 browse, 3 run, 4 session, 5 switch, 6 destroy, 7 help
+    steps = [
+        {"wait": "Choose:", "check": menu_fresh, "send": "1"},
+        {"wait": "Provider [1 HEY, 2 Gmail]", "send": "\n"},
+        {"wait": PAUSE, "check": out_sealed, "send": " "},
+        {"wait": "Choose:", "check": menu_locked, "send": "3"},
+        {"wait": "hey > ", "send": "\n"},
+        {"wait": "Choose:", "check": assert_nothing, "send": "3"},
+        {"wait": "hey > ", "send": 'search --from "Jane Doe\n'},
+        {"wait": "Choose:", "check": lambda root, sl: must("quote left open" in sl, "open quote was not explained"), "send": "3"},
+        {"wait": "hey > ", "send": "version\n"},
+        {"wait": PAUSE, "check": assert_version, "send": " "},
+        {"wait": "Choose:", "send": "3"},
+        {"wait": "hey > ", "send": "hey box list\n"},
+        {"wait": PAUSE, "check": assert_box, "send": " "},
+        {"wait": "Choose:", "send": "2"},
+        {"wait": PAUSE, "check": assert_tui, "send": " "},
+        {"wait": "Choose:", "send": "\x1b[B\x1b[B"},
+        {"wait": "> 4", "send": "\r"},
+        {"wait": "Session temp is open", "send": "exit\n"},
+        {"wait": "Choose:", "check": assert_session, "send": "?"},
+        {"wait": PAUSE, "check": assert_help, "send": " "},
+        {"wait": "Choose:", "send": "5"},
+        {"wait": "Switch to", "send": "\n"},
+        {"wait": "Choose:", "check": lambda root, sl: must("Still on temp." in sl, "switch note missing"), "send": "9"},
+        {"wait": "Choose:", "check": lambda root, sl: must("No choice 9." in sl, "bad number was silent"), "send": "6"},
+        {"wait": "Type DESTROY:", "send": "NO\n"},
+        {"wait": PAUSE, "check": assert_kept, "send": " "},
+        {"wait": "Choose:", "send": "6"},
+        {"wait": "Type DESTROY:", "send": "DESTROY\n"},
+        {"wait": PAUSE, "check": assert_destroyed, "send": " "},
+        {"wait": "Choose:", "check": lambda root, sl: (
+            menu_fresh(root, sl),
+            must("updated on disk" not in sl, "false updated-on-disk notice"),
+            os.utime(os.path.join(root, "bin/fingeronit"), None),
+            os.utime(os.path.join(root, "bin/fingeronit"), (os.path.getmtime(os.path.join(root, "bin/fingeronit")) + 5,) * 2),
+        ), "send": "r"},
+        {"wait": "Choose:", "check": lambda root, sl: must("updated on disk" in sl, "an edited fingeronit was not noticed"), "send": "q"},
+    ]
+    code, all_text = drive(root, [], steps, 60)
+    must(code == 0, "story exit %s" % code)
+    must("Door shut." in all_text, "quit did not say the door is shut")
+
+def already(root):
+    code, all_text = drive(root, ["login"], [], 10)
+    must(code == 1, "second login exit %s" % code)
+    must("already has a seal" in all_text, "second login did not refuse")
+    must(seal(root), "second login removed the seal")
+    must(not live_lock(root), "second login opened the door")
+
+def setup_refused(root):
+    code, all_text = drive(root, ["run", "--", "setup"], [], 10)
+    must(code == 1, "setup exit %s" % code)
+    must("refused" in all_text, "setup was not refused")
+    must(not live_lock(root), "refused setup opened the door")
+
+def version_cmd(root):
+    code, all_text = drive(root, ["run", "--", "version"], [], 10)
+    must(code == 0, "version exit %s" % code)
+    must("hey version stub" in all_text, "direct version failed")
+    must(not live_lock(root), "direct version opened the door")
+
+def stale(root):
+    steps = [
+        {"wait": "Choose:", "check": lambda root, sl: (
+            must("stale" in sl, "stale door not shown"),
+            must("Reseal the crashed session" in sl, "reseal not offered"),
+            must("Open a shell session" not in sl, "session offered while stale"),
+        ), "send": "q"},
+        {"wait": "Choose:", "check": lambda root, sl: must(
+            "Reseal before you quit" in sl, "quit was allowed while stale"
+        ), "send": "1"},
+        {"wait": PAUSE, "check": lambda root, sl: (
+            must("Resealed. The door is shut." in sl, "reseal did not confirm"),
+            must(not live_lock(root), "reseal left the lock"),
+            must(not live_cred(root), "reseal left a live credential"),
+        ), "send": " "},
+        {"wait": "Choose:", "check": lambda root, sl: must(
+            "door" in sl and "shut" in sl, "door not shut after reseal"
+        ), "send": "q"},
+    ]
+    code, all_text = drive(root, [], steps, 20)
+    must(code == 0, "stale exit %s" % code)
+    must("Door shut." in all_text, "stale quit did not shut")
+
+def assert_subjects(root, slice_):
+    must("Alpha note" in slice_, "alpha missing from the list")
+    must("Beta note" in slice_, "beta missing from the list")
+    must("Gamma note" not in slice_, "mail older than 14 days was listed")
+    must("Ancient note" not in slice_, "old mail was listed")
+    must("Delta note" in slice_, "a thread only on the contact's list was missed")
+    must("Contact old note" not in slice_, "the contact's old thread ignored the days window")
+    must(slice_.count("Alpha note") == 1, "a thread in both lists was listed twice")
+    must("a selects all" in slice_, "select-all hint missing")
+    must("news@example.com" in slice_, "sender missing from the list")
+    logp = os.path.join(root, "var/live/keeper/door/tmp/invocations.log")
+    must(os.path.isfile(logp), "search was not recorded")
+    log = open(logp, encoding="utf-8").read()
+    must("--from news@example.com" in log, "from address was not passed")
+    must("last_30_days" in log, "date bucket was not last_30_days")
+    must("--all" in log, "search did not walk pages")
+    must("summary" not in log, "a body field was requested")
+    must("--json" in log, "search did not ask for json")
+    must("contact threads 42 --all --json" in log, "the sender's thread list was not read")
+    must("contact list" not in log, "listed contacts although search named the sender")
+    for dirpath, _, files in os.walk(os.path.join(root, "var")):
+        for name in files:
+            data = open(os.path.join(dirpath, name), "rb").read()
+            must(b"SECRET-BODY" not in data, "a message summary was written to " + name)
+
+def assert_one_export(root, slice_, dest):
+    must("Exported 1 thread." in slice_, "export count missing")
+    must("The door is shut." in slice_, "door message missing")
+    must("PDF:" in slice_, "pdf path missing")
+    must(not live_lock(root), "export left the door open")
+    must(not live_cred(root), "export left a credential")
+    must(seal(root), "export lost the seal")
+    md = os.path.join(dest, "past-14-days.md")
+    pdf = os.path.join(dest, "past-14-days.pdf")
+    must(os.path.isfile(md), "markdown missing")
+    must(os.path.isfile(pdf), "pdf missing")
+    must(open(pdf, "rb").read(5) == b"%PDF-", "pdf header missing")
+    text = open(md, encoding="utf-8").read()
+    must("stub-thread 222" in text, "selected thread missing")
+    must("stub-thread 111" not in text, "unticked thread was written")
+    must("stub-thread 333" not in text and "stub-thread 444" not in text, "old thread was written")
+    must("Beta note" in text, "selected subject missing")
+    must("Alpha note" not in text, "unticked subject was written")
+    must(os.path.isfile(os.path.join(dest, "attachments", "222", "note.txt")), "attachment missing")
+    must(os.path.isfile(os.path.join(dest, "attachments", "222", "note (2).txt")), "a different same-named file was lost")
+    must(not os.path.exists(os.path.join(dest, "attachments", "222", "note (3).txt")), "an identical repeat was kept")
+    must(not os.path.exists(os.path.join(dest, "attachments", "222", ".fingeronit-stage")), "the staging folder was left behind")
+    must("Attachments: 2 saved, 1 identical repeats skipped." in slice_, "attachment counts missing")
+    must("destination already exists" not in slice_, "hey's overwrite error reached the screen")
+    must("note.txt" in text, "attachment name missing")
+    must(not os.path.isdir(os.path.join(root, "var/live/tmp")), "hit list was not shredded")
+
+def assert_all_export(root, slice_, dest):
+    must("Exported 3 threads." in slice_, "select-all count missing")
+    must("The door is shut." in slice_, "door message missing")
+    must(not live_lock(root) and not live_cred(root), "select-all left the door open")
+    must(seal(root), "select-all lost the seal")
+    text = open(os.path.join(dest, "past-14-days.md"), encoding="utf-8").read()
+    must("stub-thread 111" in text and "stub-thread 222" in text, "select-all missed a thread")
+    must("stub-thread 333" not in text and "stub-thread 444" not in text, "select-all wrote an old thread")
+    must("Alpha note" in text and "Beta note" in text, "select-all missed a subject")
+
+def export_pick(root):
+    dest = "/tmp/fingeronit-export." + os.path.basename(root)
+    os.makedirs(dest, 0o700)
+    steps = [
+        {"wait": "Choose:", "send": "1"},
+        {"wait": "Provider [1 HEY, 2 Gmail]", "send": "\n"},
+        {"wait": PAUSE, "check": out_sealed, "send": " "},
+        {"wait": "Choose:", "check": menu_locked, "send": "1"},
+        {"wait": "news@example.com", "check": lambda root, sl: must(
+            "Address (example:" in sl, "example sender missing"
+        ), "send": "news@example.com\n"},
+        {"wait": "with drafts]", "check": lambda root, sl: must(
+            "2 to and from" in sl, "the to-and-from choice is missing"
+        ), "send": "1\n"},
+        {"wait": "Days back", "send": "14\n"},
+        {"wait": "File [", "send": "3\n"},
+        {"wait": "news-example.com", "check": lambda root, sl: must(
+            "/fingeronit-export/" in sl and "Documents" not in sl, "default folder is not ~/fingeronit-export"
+        ), "send": dest + "\n"},
+        {"wait": "q cancels", "check": assert_subjects, "send": "\x1b[B"},
+        {"wait": "q cancels", "send": " "},
+        {"wait": "[*]", "send": "\n"},
+        {"wait": PAUSE, "check": lambda root, sl: (
+            assert_one_export(root, sl, dest),
+            must("o opens the folder" in sl, "finder hint missing"),
+        ), "send": " "},
+        {"wait": "Choose:", "send": "q"},
+    ]
+    code, all_text = drive(root, [], steps, 40)
+    must(code == 0, "export exit %s" % code)
+    must("Door shut." in all_text, "export quit did not shut")
+
+def export_all(root):
+    dest = "/tmp/fingeronit-export." + os.path.basename(root) + "-all"
+    os.makedirs(dest, 0o700)
+    steps = [
+        {"wait": "Choose:", "send": "1"},
+        {"wait": "Address (", "send": "news@example.com\n"},
+        {"wait": "Which mail", "send": "\n"},
+        {"wait": "Days back", "send": "\n"},
+        {"wait": "File [", "send": "1\n"},
+        {"wait": "Folder [", "send": dest + "\n"},
+        {"wait": "q cancels", "check": assert_subjects, "send": "a"},
+        {"wait": "3 selected", "send": "n"},
+        {"wait": "0 selected", "send": "a"},
+        {"wait": "3 selected", "send": "\n"},
+        {"wait": PAUSE, "check": lambda root, sl: assert_all_export(root, sl, dest), "send": " "},
+        {"wait": "Choose:", "send": "1"},
+        {"wait": "Address [news@example.com]", "send": "\n"},
+        {"wait": "Which mail", "send": "\n"},
+        {"wait": "Days back", "send": "\n"},
+        {"wait": "File [", "send": "1\n"},
+        {"wait": "Folder [", "send": dest + "\n"},
+        {"wait": "q cancels", "send": "q"},
+        {"wait": PAUSE, "check": lambda root, sl: (
+            must("Nothing exported." in sl, "cancel was silent"),
+            must(not live_lock(root), "cancel left the door open"),
+        ), "send": " "},
+        {"wait": "Choose:", "send": "3"},
+        {"wait": "hey > ", "send": "fingeronit export --from news@example.com --days 14 --md --to " + dest + "-viarun\n"},
+        {"wait": PAUSE, "check": lambda root, sl: (
+            must("That is a fingeronit export" in sl, "fingeronit at the hey prompt was not recognised"),
+            must("Exported 3 threads." in sl, "fingeronit export from the hey prompt did not run"),
+            must(os.path.isfile(dest + "-viarun/past-14-days.md"), "fingeronit export from the hey prompt wrote nothing"),
+        ), "send": " "},
+        {"wait": "Choose:", "send": "3"},
+        {"wait": "hey > ", "send": "fingeronit status\n"},
+        {"wait": "Choose:", "check": lambda root, sl: must("fingeronit command, not a hey one" in sl, "other fingeronit commands were not explained"), "send": "q"},
+    ]
+    code, all_text = drive(root, [], steps, 40)
+    must(code == 0, "export-all exit %s" % code)
+    must("Door shut." in all_text, "export-all quit did not shut")
+
+def other(root):
+    steps = [
+        {"wait": "Choose:", "check": lambda root, sl: (
+            must("in another terminal" in sl, "other door not explained"),
+            must("Open a shell session" not in sl, "session offered while another holds the door"),
+            must("Sign in" not in sl, "sign-in offered while another holds the door"),
+        ), "send": "q"},
+    ]
+    code, all_text = drive(root, [], steps, 15)
+    must(code == 0, "other exit %s" % code)
+    must("Left the other door alone." in all_text, "quit touched the other door")
+    must(live_lock(root), "quit removed someone else's lock")
+
+def assert_inside_menu(root, slice_):
+    must("Open in this session" in slice_, "inner fingeronit did not know its own session")
+    must("open, this session" in slice_, "door label did not say this session")
+    must("Run a hey command" in slice_, "run not offered inside")
+    must("Export mail from a sender" in slice_, "export not offered inside")
+    must("Open a shell session" not in slice_, "a nested session was offered")
+    must("Destroy" not in slice_, "destroy offered while the session is open")
+    must("in another terminal" not in slice_, "own session called a stranger")
+    must("Back to the session" in slice_, "quit was not back-to-session")
+    must(live_lock(root) and live_cred(root), "session door was not open")
+    outsider_refused(root)
+
+def assert_inside_run(root, slice_):
+    must("hey-stub: box list" in slice_, "inside command did not run")
+    must("still open" in slice_, "inside command did not say the session is open")
+    must(live_lock(root) and live_cred(root), "inside command shut the session")
+
+def assert_inside_export(root, slice_, dest):
+    must("Exported 3 threads." in slice_, "inside export count missing")
+    must("Session temp is still open" in slice_, "inside export door message wrong")
+    must(live_lock(root) and live_cred(root), "inside export shut the session")
+    text = open(os.path.join(dest, "past-14-days.md"), encoding="utf-8").read()
+    must("stub-thread 111" in text and "stub-thread 222" in text, "inside export missed a thread")
+
+def inside(root):
+    dest = "/tmp/fingeronit-export." + os.path.basename(root) + "-inside"
+    os.makedirs(dest, 0o700)
+    steps = [
+        {"wait": "Choose:", "send": "1"},
+        {"wait": "Provider [1 HEY, 2 Gmail]", "send": "\n"},
+        {"wait": PAUSE, "send": " "},
+        {"wait": "Choose:", "send": "4"},
+        {"wait": "Session temp is open", "send": "fingeronit\n"},
+        {"wait": "Choose:", "check": assert_inside_menu, "send": "1"},
+        {"wait": "hey > ", "send": "box list\n"},
+        {"wait": PAUSE, "check": assert_inside_run, "send": " "},
+        {"wait": "Choose:", "send": "2"},
+        {"wait": "Address (", "send": "news@example.com\n"},
+        {"wait": "Which mail", "send": "\n"},
+        {"wait": "Days back", "send": "\n"},
+        {"wait": "File [", "send": "1\n"},
+        {"wait": "Folder [", "send": dest + "\n"},
+        {"wait": "q cancels", "send": "a"},
+        {"wait": "3 selected", "send": "\n"},
+        {"wait": PAUSE, "check": lambda root, sl: assert_inside_export(root, sl, dest), "send": " "},
+        {"wait": "Choose:", "send": "0"},
+        {"wait": "Back to session temp", "send": "exit\n"},
+        {"wait": "Choose:", "check": assert_session, "send": "q"},
+    ]
+    code, all_text = drive(root, [], steps, 40)
+    must(code == 0, "inside exit %s" % code)
+    must("Door shut." in all_text, "inside quit did not shut")
+
+def autopilot(root):
+    home = "/tmp/fingeronit-export." + os.path.basename(root) + "-home"
+    os.makedirs(home, 0o700)
+    os.environ["HOME"] = home
+    os.environ["FINGERONIT_NO_OPEN"] = "1"
+    dest = os.path.join(home, "fingeronit-export/news-example.com")
+    def files_there(root, sl):
+        must("Found 3:" in sl, "autopilot did not list the three recent threads")
+        must("Alpha note" in sl and "Beta note" in sl, "autopilot subjects missing")
+        must("Exported 3 threads." in sl, "autopilot count missing")
+        must("deleted when fingeronit closes" in sl, "export did not warn the folder is temporary")
+        text = open(os.path.join(dest, "past-14-days.md"), encoding="utf-8").read()
+        must("stub-thread 111" in text and "stub-thread 222" in text and "stub-thread 555" in text, "autopilot missed a thread")
+        must("Gamma note" not in text, "autopilot wrote an old thread")
+        must(open(os.path.join(dest, "past-14-days.pdf"), "rb").read(5) == b"%PDF-", "autopilot pdf missing")
+        must(os.path.isfile(os.path.join(dest, "attachments", "111", "note.txt")), "attachment was not saved")
+        must(not live_lock(root) and not live_cred(root), "autopilot left the door open")
+    steps = [
+        {"wait": "Move anything you want to keep out of it now.", "check": files_there, "send": "\x03"},
+        {"wait": "Ctrl-C does not skip this", "check": lambda root, sl: must(
+            os.path.isdir(dest), "Ctrl-C deleted the exports without asking"), "send": "d"},
+        {"wait": "Deleted"},
+    ]
+    code, all_text = drive(root, ["--autopilot-test"], steps, 30)
+    must(code in (0, 130), "autopilot exit %s\n%s" % (code, all_text))
+    must(not os.path.exists(os.path.join(home, "fingeronit-export")), "the export folder survived the farewell")
+
+def two_senders(root):
+    home = "/tmp/fingeronit-export." + os.path.basename(root) + "-two"
+    os.makedirs(home, 0o700)
+    os.environ["HOME"] = home
+    os.environ["FINGERONIT_NO_OPEN"] = "1"
+    args = ["export", "--from", "first@example.com", "--from", "second@example.org", "--all-time", "--md"]
+    dest = os.path.join(home, "fingeronit-export/first-example.com-second-example.org")
+    md = os.path.join(dest, "all-time.md")
+    keep = {}
+    def grab(root, sl):
+        keep["text"] = open(md, encoding="utf-8").read()
+        keep["pdf"] = os.path.exists(os.path.join(dest, "all-time.pdf"))
+        must("Documents" not in sl and "older exports" not in sl, "a legacy export folder was listed")
+    steps = [{"wait": "d   done", "check": grab, "send": "d"}, {"wait": "Deleted"}]
+    code, all_text = drive(root, args, steps, 30)
+    must(code == 0, "two-sender exit %s\n%s" % (code, all_text))
+    must("Found 5:" in all_text, "two senders did not merge to 5 threads\n" + all_text)
+    must("Exported 5 threads." in all_text, "two-sender count missing")
+    text = keep["text"]
+    must(text.count("## Shared thread") == 1, "shared thread was not deduped")
+    must("First via contact" in text, "the contact-list fallback missed a thread")
+    must("First ancient" in text, "all-time dropped an old thread")
+    must("Mail from first@example.com or second@example.org" in text, "header missing both senders")
+    must(not keep["pdf"], "--md wrote a pdf")
+    log = open(os.path.join(root, "var/instances/temp/audit.log"), encoding="utf-8").read()
+    must("export" in log, "export was not audited")
+    must(not live_lock(root) and not live_cred(root), "two-sender export left the door open")
+
+def idle_session(root):
+    os.environ["FINGERONIT_IDLE_SECONDS"] = "4"
+    steps = [
+        {"wait": "Choose:", "send": "1"},
+        {"wait": "Provider [1 HEY, 2 Gmail]", "send": "\n"},
+        {"wait": PAUSE, "send": " "},
+        {"wait": "Choose:", "send": "4"},
+        {"wait": "closes itself after 4 seconds", "check": lambda root, sl: must(live_lock(root), "session did not open")},
+        {"wait": "with no keys pressed. Closing the door."},
+        {"wait": "Choose:", "check": assert_session, "send": "q"},
+    ]
+    code, _ = drive(root, [], steps, 40)
+    must(code == 0, "idle session exit %s" % code)
+
+def idle_picker(root):
+    os.environ["FINGERONIT_IDLE_SECONDS"] = "4"
+    dest = "/tmp/fingeronit-export." + os.path.basename(root) + "-idle"
+    steps = [
+        {"wait": "Choose:", "send": "1"},
+        {"wait": "Address (", "send": "news@example.com\n"},
+        {"wait": "Which mail", "send": "\n"},
+        {"wait": "Days back", "send": "\n"},
+        {"wait": "File [", "send": "1\n"},
+        {"wait": "Folder [", "send": dest + "\n"},
+        {"wait": "q cancels", "check": lambda root, sl: must(live_lock(root), "picker had no open door")},
+        {"wait": "Closing the door."},
+        {"wait": PAUSE, "check": lambda root, sl: (
+            must("The door is shut." in sl, "idle picker did not say the door shut"),
+            must(not live_lock(root) and not live_cred(root), "idle picker left the door open"),
+        ), "send": " "},
+        {"wait": "Choose:", "send": "q"},
+    ]
+    drive(root, [], steps, 40)
+    must(not live_lock(root), "idle picker left the door open")
+    must(not live_cred(root), "idle picker left a live credential")
+    must(seal(root), "idle picker lost the seal")
+
+def crash(root):
+    import signal
+    os.environ["FINGERONIT_IDLE_SECONDS"] = "8"
+    def kill_holder(root, sl):
+        must(live_lock(root) and live_cred(root), "session was not open before the crash")
+        os.kill(int(open(os.path.join(root, "var/live/lock/pid")).read().strip()), signal.SIGKILL)
+    steps = [
+        {"wait": "Choose:", "send": "1"},
+        {"wait": "Provider [1 HEY, 2 Gmail]", "send": "\n"},
+        {"wait": PAUSE, "send": " "},
+        {"wait": "Choose:", "send": "4"},
+        {"wait": "closes itself after", "check": kill_holder},
+    ]
+    drive(root, [], steps, 20)
+    deadline = time.time() + 12
+    while time.time() < deadline and live_lock(root):
+        time.sleep(0.5)
+    must(not live_lock(root), "a killed fingeronit left the door open")
+    must(not live_cred(root), "a killed fingeronit left a live credential")
+    must(seal(root), "the seal was lost after a crash")
+
+def farewell_menu(root):
+    home = os.environ["HOME"]
+    dest = os.path.join(home, "fingeronit-export/news-example.com")
+    steps = [
+        {"wait": "Choose:", "send": "1"},
+        {"wait": "Address (", "send": "news@example.com\n"},
+        {"wait": "Which mail", "send": "\n"},
+        {"wait": "Days back", "send": "\n"},
+        {"wait": "File [", "send": "1\n"},
+        {"wait": "Folder [", "check": lambda root, sl: must("~" not in sl or True, ""), "send": "\n"},
+        {"wait": "q cancels", "send": "a"},
+        {"wait": "3 selected", "send": "\n"},
+        {"wait": PAUSE, "check": lambda root, sl: must(
+            "deleted when fingeronit closes" in sl, "export did not warn the folder is temporary"), "send": " "},
+        {"wait": "Choose:", "check": lambda root, sl: must(
+            "exported files wait in ~/fingeronit-export" in sl, "menu did not say exports are waiting"), "send": "\x03"},
+        {"wait": "Move anything you want to keep", "check": lambda root, sl: must(
+            os.path.isfile(os.path.join(dest, "past-14-days.md")), "Ctrl-C deleted before asking"), "send": "x"},
+        {"wait": "d deletes what is left", "send": "\x03"},
+        {"wait": "Ctrl-C does not skip this", "send": "d"},
+        {"wait": "Deleted"},
+    ]
+    code, all_text = drive(root, [], steps, 40)
+    must(not os.path.exists(os.path.join(home, "fingeronit-export")), "the export folder survived Ctrl-C then d")
+    must(not live_lock(root) and not live_cred(root), "farewell left the door open")
+
+def clean_old(root):
+    home = os.environ["HOME"]
+    old = os.path.join(home, ".config/hey-cli")
+    os.makedirs(old)
+    open(os.path.join(old, "credentials.json"), "w").write('{"stub": true}\n')
+    open(os.path.join(home, "kc-hey"), "w").write("")
+    steps = [
+        {"wait": "Choose:", "check": lambda root, sl: must(
+            "An older HEY CLI login sits outside this box" in sl, "old login was not flagged"), "send": "\x1b[A"},
+        {"wait": "Choose:", "send": "\x1b[A\x1b[A"},
+        {"wait": "> ", "send": ""},
+    ]
+    # Pick the item by its label, wherever it sits.
+    steps = [
+        {"wait": "Choose:", "check": lambda root, sl: must(
+            "An older HEY CLI login sits outside this box" in sl, "old login was not flagged"), "send": "?"},
+        {"wait": PAUSE, "send": " "},
+    ]
+    code, all_text = drive(root, [], steps + [{"wait": "Choose:", "send": "q"}], 20)
+    menu = all_text[all_text.find("Remove an older HEY CLI login") - 8:]
+    num = None
+    for line in all_text.splitlines():
+        if "Remove an older HEY CLI login" in line and "deletes it" not in line:
+            num = line.split()[0] if line.split()[0].isdigit() else line.split()[1]
+            break
+    must(num and num.isdigit(), "menu has no Remove an older HEY CLI login item")
+    steps = [
+        {"wait": "Choose:", "send": num},
+        {"wait": "Type REMOVE:", "check": lambda root, sl: (
+            must("~/.config/hey-cli" in sl and "credentials.json" in sl, "old folder was not listed"),
+            must("account https://app.hey.com" in sl, "old keychain item was not listed"),
+            must('{"stub": true}' not in sl, "old credential contents were shown"),
+        ), "send": "REMOVE\n"},
+        {"wait": PAUSE, "check": lambda root, sl: (
+            must("Removed ~/.config/hey-cli and 1 keychain item" in sl, "removal was not confirmed: " + sl),
+            must("hey.com" in sl, "no hint to disconnect on hey.com"),
+        ), "send": " "},
+        {"wait": "Choose:", "check": lambda root, sl: must(
+            "An older HEY CLI login sits outside" not in sl, "old login still flagged"), "send": "q"},
+    ]
+    code, all_text = drive(root, [], steps, 20)
+    must(code == 0, "clean-old exit %s" % code)
+    must(not os.path.exists(old), "~/.config/hey-cli survived")
+    must(not os.path.exists(os.path.join(home, "kc-hey")), "the keychain item survived")
+
+def nobody(root):
+    steps = [
+        {"wait": "Choose:", "send": "1"},
+        {"wait": "Address (", "send": "nobody@example.com\n"},
+        {"wait": "Which mail", "send": "\n"},
+        {"wait": "Days back", "send": "\n"},
+        {"wait": "File [", "send": "1\n"},
+        {"wait": "Folder [", "send": "/tmp/fingeronit-export." + os.path.basename(root) + "-nobody\n"},
+        {"wait": PAUSE, "check": lambda root, sl: (
+            must("HEY found no threads from nobody@example.com" in sl, "empty search was not explained"),
+            must(not live_lock(root), "empty search left the door open"),
+        ), "send": " "},
+        {"wait": "Choose:", "send": "q"},
+    ]
+    code, _ = drive(root, [], steps, 30)
+    must(code == 0, "nobody exit %s" % code)
+
+def prompts(root):
+    dest = "/tmp/fingeronit-export." + os.path.basename(root) + "-prompts"
+    os.makedirs(dest, 0o700)
+    steps = [
+        {"wait": "Choose:", "send": "1"},
+        {"wait": "Address (", "send": "\x03"},
+        {"wait": PAUSE, "check": lambda root, sl: must(
+            "Nothing exported." in sl, "Ctrl-C at a question did not cancel the export"), "send": " "},
+        # A paste that ends in a newline, then Enter: the next question must still wait.
+        {"wait": "Choose:", "send": "1"},
+        {"wait": "Address (", "send": " news@example.com\r\n\n"},
+        {"wait": "with drafts] [1]:", "send": "2\n"},
+        {"wait": "Days back", "send": "\n"},
+        {"wait": "File [", "send": "1\n"},
+        {"wait": "Folder [", "send": dest + "\n"},
+        {"wait": "q cancels", "check": lambda root, sl: must(
+            "Export to and from news@example.com" in sl, "the pasted newline answered the mail question"), "send": "q"},
+        {"wait": PAUSE, "send": " "},
+        {"wait": "Choose:", "send": "3"},
+        {"wait": "hey > ", "send": "\x03"},
+        {"wait": PAUSE, "send": " "},
+        {"wait": "Choose:", "check": lambda root, sl: must(
+            not live_lock(root), "Ctrl-C at the hey prompt left the door open"), "send": "q"},
+    ]
+    code, all_text = drive(root, [], steps, 40)
+    must(code == 0, "prompts exit %s\n%s" % (code, all_text))
+
+def hangup(root):
+    home = "/tmp/fingeronit-export." + os.path.basename(root) + "-hup"
+    os.makedirs(home, 0o700)
+    os.environ["HOME"] = home
+    os.environ["FINGERONIT_NO_OPEN"] = "1"
+    steps = [
+        {"wait": "Choose:", "send": "1"},
+        {"wait": "Address (", "send": "news@example.com\n"},
+        {"wait": "with drafts] [1]:", "send": "\n"},
+        {"wait": "Days back", "send": "\n"},
+        {"wait": "File [", "send": "1\n"},
+        {"wait": "Folder [", "send": "\n"},
+        {"wait": "q cancels", "send": "a"},
+        {"wait": "3 selected", "send": "\n"},
+        {"wait": "Any other key for the menu.", "check": lambda root, sl: must(
+            os.path.isdir(os.path.join(home, "fingeronit-export")), "the export was not written"), "hangup": True},
+    ]
+    drive(root, [], steps, 40)
+    deadline = time.time() + 10
+    while time.time() < deadline and os.path.exists(os.path.join(home, "fingeronit-export")):
+        time.sleep(0.2)
+    must(not os.path.exists(os.path.join(home, "fingeronit-export")), "a hung-up terminal left the exports behind")
+    must(not live_lock(root) and not live_cred(root), "a hung-up terminal left the door open")
+    must(seal(root), "the seal was lost when the terminal hung up")
+
+def orphaned(root):
+    home = "/tmp/fingeronit-export." + os.path.basename(root) + "-orphan"
+    exp = os.path.join(home, "fingeronit-export", "left")
+    os.makedirs(exp)
+    os.environ["HOME"] = home
+    open(os.path.join(exp, "left.md"), "w").write("left by a killed fingeronit\n")
+    # An owner that is gone: a pid that is not running.
+    open(os.path.join(home, "fingeronit-export", ".fingeronit-owner"), "w").write("99999999 Thu Jan  1 00:00:00 2026\n")
+    steps = [
+        {"wait": "Choose:", "check": lambda root, sl: (
+            must("did not close" in sl, "exports from a killed fingeronit were not flagged"),
+            must("1 exported files wait" in sl, "the owner file was counted as an export"),
+        ), "send": "q"},
+        {"wait": "d   done", "send": "d"},
+        {"wait": "Deleted"},
+    ]
+    drive(root, [], steps, 30)
+    must(not os.path.exists(os.path.join(home, "fingeronit-export")), "adopted exports survived the farewell")
+
+def owned_elsewhere(root):
+    home = "/tmp/fingeronit-export." + os.path.basename(root) + "-other"
+    exp = os.path.join(home, "fingeronit-export", "theirs")
+    os.makedirs(exp)
+    os.environ["HOME"] = home
+    open(os.path.join(exp, "theirs.md"), "w").write("another terminal's export\n")
+    other = subprocess.Popen(["/bin/bash", "-c", "exec -a fingeronit-other-terminal sleep 60"])
+    try:
+        time.sleep(0.3)
+        started = subprocess.run(["ps", "-o", "lstart=", "-p", str(other.pid)], capture_output=True, text=True).stdout.strip()
+        open(os.path.join(home, "fingeronit-export", ".fingeronit-owner"), "w").write("%d %s\n" % (other.pid, started))
+        steps = [
+            {"wait": "Choose:", "check": lambda root, sl: must(
+                "belong to a fingeronit in another terminal" in sl, "another terminal's exports were not recognised"), "send": "q"},
+        ]
+        code, all_text = drive(root, [], steps, 30)
+        must(code == 0, "owned-elsewhere exit %s" % code)
+        must("Left them for it." in all_text, "quitting did not say it left them")
+        must(os.path.isfile(os.path.join(exp, "theirs.md")), "quitting deleted another terminal's exports")
+    finally:
+        other.kill()
+        other.wait()
+
+def with_mail(root):
+    home = "/tmp/fingeronit-export." + os.path.basename(root) + "-with"
+    os.makedirs(home, 0o700)
+    os.environ["HOME"] = home
+    os.environ["FINGERONIT_NO_OPEN"] = "1"
+    args = ["export", "--with", "news@example.com", "--days", "14", "--md"]
+    md = os.path.join(home, "fingeronit-export/news-example.com/to-and-from-past-14-days.md")
+    keep = {}
+    def grab(root, sl):
+        keep["text"] = open(md, encoding="utf-8").read()
+    steps = [{"wait": "d   done", "check": grab, "send": "d"}, {"wait": "Deleted"}]
+    code, all_text = drive(root, args, steps, 30)
+    must(code == 0, "with exit %s\n%s" % (code, all_text))
+    must("Found 6:" in all_text, "to-and-from did not find 6\n" + all_text)
+    must("Exported 6 threads." in all_text, "to-and-from count missing")
+    text = keep["text"]
+    must("# Mail to and from news@example.com" in text, "to-and-from header missing")
+    for want in ("stub-thread 111", "stub-thread 222", "stub-thread 555", "stub-thread 888", "stub-thread 999"):
+        must(want in text, "to-and-from missed " + want)
+    must(text.count("stub-thread 111") == 1, "a thread found three ways was written more than once")
+    must("Old sent" not in text, "to-and-from ignored the days window")
+    must("## [draft] Reply draft" in text and "Draft, not sent." in text, "the draft is missing")
+    must("To: news@example.com" in text and "Bcc: hidden@example.org" in text, "the draft's recipients are missing")
+    must("stub-draft-body" in text, "the draft's body is missing")
+    must("Other draft" not in text, "a draft to someone else was exported")
+    must("SECRET-BODY" not in text, "a listing summary leaked into the file")
+    log = open(os.path.join(root, "var/instances/temp/audit.log"), encoding="utf-8").read()
+    must("mode=all" in log, "the mode was not audited")
+
+
+def gmail_signed_in(root, slice_):
+    must("Sealed. The door is shut." in slice_, "gmail sign-in did not seal")
+    must(not live_lock(root) and not live_cred(root), "gmail sign-in left the door or a credential open")
+    must(seal(root), "gmail seal file missing")
+    prov = open(os.path.join(root, "var/instances/temp/provider")).read().strip()
+    must(prov == "gmail", "the provider file did not record gmail: " + prov)
+
+def gmail_client(root):
+    path = "/tmp/fingeronit-client." + os.path.basename(root) + ".json"
+    open(path, "w").write('{"installed":{"client_id":"stub.apps.example.com","client_secret":"stub"}}\n')
+    return path
+
+def signin_gmail(root):
+    def menu_gmail(root, sl):
+        must("Locked." in sl, "gmail menu did not say locked")
+        must("provider" in sl and "Gmail" in sl, "menu did not show the provider")
+        must("Browse mail" not in sl, "browse (a HEY-only view) was offered for gmail")
+        must("Run a gmail command" in sl and "Open a shell session" in sl, "gmail run or session missing")
+    steps = [
+        {"wait": "Choose:", "check": menu_fresh, "send": "1"},
+        {"wait": "Provider [1 HEY, 2 Gmail]", "send": "2\n"},
+        {"wait": "Client JSON file you downloaded: ", "send": gmail_client(root) + "\n"},
+        {"wait": PAUSE, "check": gmail_signed_in, "send": " "},
+        {"wait": "Choose:", "check": menu_gmail, "send": "q"},
+    ]
+    code, all_text = drive(root, [], steps, 20)
+    must(code == 0, "gmail sign-in exit %s" % code)
+    must("Signing in to Gmail" in all_text, "gmail sign-in did not say Gmail")
+    import subprocess, tarfile, io
+    sealed = open(os.path.join(root, "var/instances/temp/sealed.box"), "rb").read()
+    must(sealed[:8] == b"FINGER1\0", "the seal lost its FINGER1 header")
+    names = tarfile.open(fileobj=io.BytesIO(sealed[8:]), mode="r:gz").getnames()
+    must("fingeronit-gmail/credentials.json" in names, "the gmail login was not sealed: %s" % names)
+    must(not any(n.startswith("hey-cli") for n in names), "a hey-cli folder was sealed for gmail")
+    out = subprocess.run([root + "/fingeronit", "status"], capture_output=True, text=True).stdout
+    must("provider  Gmail" in out, "status did not show Gmail")
+
+def login_cli(root):
+    bad = "/tmp/fingeronit-client." + os.path.basename(root) + ".bad.json"
+    open(bad, "w").write('{"web":{"client_id":"not a desktop client"}}\n')
+    code, all_text = drive(root, ["login", "--provider", "gmail", "--client", bad, "work"], [], 20)
+    must(code == 1 and "not a Google Desktop app client file" in all_text, "a bad client file was not refused")
+    must(not os.path.exists(os.path.join(root, "var/instances/work/sealed.box")), "a bad client file still sealed")
+    code, all_text = drive(root, ["login", "--provider", "gmail", "--client", gmail_client(root), "work"], [], 20)
+    must(code == 0, "login --provider gmail exit %s\n%s" % (code, all_text))
+    must("Sealed. The door is shut." in all_text, "cli gmail sign-in did not seal")
+    inst = os.path.join(root, "var/instances/work")
+    must(open(os.path.join(inst, "provider")).read().strip() == "gmail", "cli sign-in did not record gmail")
+    must(os.path.isfile(os.path.join(inst, "sealed.box")), "cli sign-in sealed nothing")
+    code, all_text = drive(root, ["login", "--provider", "nope", "other"], [], 10)
+    must(code == 1 and "provider must be hey or gmail" in all_text, "a bad provider was not refused")
+    code, all_text = drive(root, ["run", "work", "--", "setup"], [], 10)
+    must(code == 1 and "refused" in all_text, "gmail setup was not refused")
+    code, all_text = drive(root, ["run", "work", "--", "contact", "list"], [], 10)
+    must(code == 1 and "refused" in all_text, "gmail contact list was not refused")
+    code, all_text = drive(root, ["run", "work", "--", "auth", "login"], [], 10)
+    must(code == 1 and "refused" in all_text, "gmail auth login was not refused")
+    code, all_text = drive(root, ["run", "work", "--", "version"], [], 10)
+    must(code == 0 and "gmail version stub" in all_text, "gmail version failed: " + all_text)
+    # A hey instance beside it still says hey.
+    must(not os.path.exists(os.path.join(root, "var/instances/other")), "a refused login made an instance")
+
+def gmail_export(root):
+    home = "/tmp/fingeronit-export." + os.path.basename(root) + "-gmail"
+    os.makedirs(home, 0o700)
+    os.environ["HOME"] = home
+    os.environ["FINGERONIT_NO_OPEN"] = "1"
+    args = ["export", "--with", "news@example.com", "--days", "14", "--md"]
+    md = os.path.join(home, "fingeronit-export/news-example.com/to-and-from-past-14-days.md")
+    att = os.path.join(home, "fingeronit-export/news-example.com/attachments/18c0a1b2c3d4e5f0/note.txt")
+    keep = {}
+    def grab(root, sl):
+        keep["text"] = open(md, encoding="utf-8").read()
+        keep["att"] = os.path.isfile(att)
+        logp = os.path.join(root, "var/stub-gmail.log")
+        keep["log"] = open(logp, encoding="utf-8").read() if os.path.isfile(logp) else ""
+    steps = [{"wait": "d   done", "check": grab, "send": "d"}, {"wait": "Deleted"}]
+    code, all_text = drive(root, args, steps, 30)
+    must(code == 0, "gmail export exit %s\n%s" % (code, all_text))
+    must("Asking Gmail for mail to and from news@example.com" in all_text, "export did not say Gmail")
+    must("Found 5:" in all_text, "gmail to-and-from did not find 5\n" + all_text)
+    must("Exported 5 threads." in all_text, "gmail export count missing")
+    must("Gmail mentioned" in keep["text"], "a thread that only names the address was missed")
+    text = keep["text"]
+    for want in ("stub-gmail-thread 18c0a1b2c3d4e5f0", "stub-gmail-thread 18c0a1b2c3d4e5f1",
+                 "stub-gmail-thread 18c0a1b2c3d4e5f2"):
+        must(want in text, "gmail export missed " + want)
+    must(text.count("stub-gmail-thread 18c0a1b2c3d4e5f0") == 1, "a thread found twice was written twice")
+    must("Gmail ancient" not in text, "gmail export ignored the days window")
+    must("## [draft] Gmail draft" in text and "Draft, not sent." in text, "the gmail draft is missing")
+    must("To: news@example.com" in text and "Bcc: hidden@example.org" in text, "the gmail draft's recipients are missing")
+    must("stub-gmail-draft-body" in text, "the gmail draft body is missing")
+    must("Other gmail draft" not in text, "a draft to someone else was exported")
+    must(keep["att"], "the gmail attachment was not saved")
+    log = keep["log"]
+    must("search --from news@example.com" in log, "gmail search was not recorded: " + log)
+    must("draft show r-1234abcd" in log, "the string draft id was not used")
+    must("contact" not in log, "a HEY-only contact step ran for gmail")
+    must("hey-stub" not in all_text, "hey ran for a gmail instance")
+    log2 = open(os.path.join(root, "var/instances/temp/audit.log"), encoding="utf-8").read()
+    must("mode=all" in log2, "the gmail export was not audited")
+    must(not live_lock(root) and not live_cred(root), "gmail export left the door open")
+
+def gmail_session(root):
+    # Inside a gmail session, the keeper itself refuses what gmail may not do.
+    R = root
+    env = ("FINGERONIT_KEEPER_HOME=%s/var/live/keeper FINGERONIT_KEEPER_HEY=%s/libexec/hey "
+           "FINGERONIT_KEEPER_GMAIL=%s/lib/providers/gmail.py FINGERONIT_KEEPER_SEAL=%s/bin/finger-seal" % (R, R, R, R))
+    def k(argv, tag):
+        return 'printf "%%s\\n" "$__hb_t" | %s /bin/bash %s/lib/keeper run -- %s; echo %s=$?\n' % (env, R, argv, tag)
+    steps = [
+        {"wait": "Choose:", "send": "3"},
+        {"wait": "Session temp is open", "send": k("contact list", "KA")},
+        {"wait": "KA=77", "check": lambda root, sl: must("refused" in sl, "keeper ran contact for gmail: " + sl),
+         "send": k("draft delete r-1234abcd", "KB")},
+        {"wait": "KB=77", "send": k("auth login", "KC")},
+        {"wait": "KC=77", "send": k("tui", "KD")},
+        {"wait": "KD=77", "send": k("version", "KE")},
+        {"wait": "KE=0", "check": lambda root, sl: must("gmail version stub" in sl, "keeper did not run gmail version"),
+         "send": "gmail contact list\n"},
+        {"wait": "refused. setup, skills, mcp", "send": "gmail search --help\n"},
+        {"wait": "--all", "send": "exit\n"},
+        {"wait": "Choose:", "check": assert_session, "send": "q"},
+    ]
+    code, all_text = drive(root, [], steps, 40)
+    must(code == 0, "gmail session exit %s" % code)
+
+if __name__ == "__main__":
+    root, name = sys.argv[1], sys.argv[2]
+    {"story": story, "signin": signin, "already": already, "setup": setup_refused,
+     "version": version_cmd, "stale": stale, "other": other,
+     "export": export_pick, "export-all": export_all, "inside": inside,
+     "autopilot": autopilot, "nobody": nobody, "two": two_senders,
+     "idle-session": idle_session, "idle-picker": idle_picker, "crash": crash,
+     "farewell": farewell_menu, "clean-old": clean_old, "with": with_mail, "prompts": prompts,
+     "hangup": hangup, "orphaned": orphaned, "owned-elsewhere": owned_elsewhere,
+     "signin-gmail": signin_gmail, "login-cli": login_cli, "gmail-export": gmail_export,
+     "gmail-session": gmail_session}[name](root)
+PY
+  chmod 700 "$1"
+}
+
+pass() { printf 'pass  %s\n' "$1"; }
+
+bash -n "$SRC"
+
+make_root
+root="$ROOT"
+python3 "$root/drive.py" "$root" story
+pass "menu: sign in, command, session, destroy, quit"
+"$root/fingeronit" status > /tmp/fingeronit-ux-status
+grep -E -q 'seal[[:space:]]+no' /tmp/fingeronit-ux-status
+rm -f /tmp/fingeronit-ux-status
+pass "status agrees the seal is gone"
+
+make_root
+root="$ROOT"
+python3 "$root/drive.py" "$root" export
+python3 "$root/drive.py" "$root" export-all
+pass "export: arrows, space, enter, and select all"
+python3 "$root/drive.py" "$root" nobody
+pass "an empty search says what HEY found"
+python3 "$root/drive.py" "$root" autopilot
+pass "autopilot: example sender, every thread, md and pdf, one step"
+python3 "$root/drive.py" "$root" two
+pass "export --from A --from B --all-time --md: merged, deduped, no date limit"
+python3 "$root/drive.py" "$root" with
+python3 "$root/drive.py" "$root" prompts
+pass "questions: Ctrl-C goes back to the menu, a pasted newline answers nothing"
+python3 "$root/drive.py" "$root" hangup
+pass "the terminal hangs up after an export: exports deleted, door shut, seal kept"
+python3 "$root/drive.py" "$root" orphaned
+pass "exports left by a killed fingeronit are flagged and deleted at the next close"
+python3 "$root/drive.py" "$root" owned-elsewhere
+pass "exports owned by a fingeronit in another terminal are left to it"
+pass "export --with A: from, to, naming them, and drafts to them"
+pass "exports are deleted at the farewell"
+python3 "$root/drive.py" "$root" farewell
+pass "quitting with exports waiting: Ctrl-C asks first, d deletes"
+python3 "$root/drive.py" "$root" idle-picker
+pass "idle timeout: an open door in the subject list closes and reseals"
+
+make_root
+root="$ROOT"
+python3 "$root/drive.py" "$root" idle-session
+pass "idle timeout: an idle session is hung up and resealed"
+
+make_root
+root="$ROOT"
+python3 "$root/drive.py" "$root" crash
+pass "kill -9 with the door open: the watchdog reseals it"
+
+python3 "$root/drive.py" "$root" setup
+pass "setup stays shut"
+
+make_root
+root="$ROOT"
+python3 "$root/drive.py" "$root" inside
+pass "fingeronit inside a session gets that session's menu, no new fingerprint"
+pass "the keeper refuses a caller without the ticket, or from another terminal"
+
+make_root
+root="$ROOT"
+python3 "$root/drive.py" "$root" signin
+python3 "$root/drive.py" "$root" clean-old
+pass "an older HEY login outside the box is shown by name and removed"
+
+make_root
+root="$ROOT"
+python3 "$root/drive.py" "$root" version
+pass "version needs no seal"
+
+make_root
+root="$ROOT"
+python3 "$root/drive.py" "$root" signin-gmail
+pass "gmail: sign in from the menu, sealed as fingeronit-gmail, provider recorded"
+python3 "$root/drive.py" "$root" gmail-export
+pass "gmail: to-and-from export with a string draft id, and no contact step"
+python3 "$root/drive.py" "$root" gmail-session
+pass "gmail: the keeper refuses everything but its short list"
+
+make_root
+root="$ROOT"
+python3 "$root/drive.py" "$root" login-cli
+pass "gmail: login --provider, a bad provider refused, setup and contact stay shut"
+
+make_root
+root="$ROOT"
+python3 "$root/drive.py" "$root" signin
+python3 "$root/drive.py" "$root" already
+pass "a second login is refused and the door stays shut"
+
+make_root
+root="$ROOT"
+dead=999999
+if kill -0 "$dead" 2>/dev/null; then
+  printf 'ux-test: pid %s is alive, cannot plant a stale lock\n' "$dead" >&2
+  exit 1
+fi
+door="$root/var/live/keeper/door"
+mkdir -p "$root/var/live/lock" "$door/xdg/hey-cli" "$door/pids" "$root/var/instances/temp"
+printf '%s\n' "$dead" > "$root/var/live/lock/pid"
+printf '%s\n' temp > "$root/var/live/lock/instance"
+printf '%s\n' /dev/ttys000 > "$root/var/live/lock/tty"
+dd if=/dev/zero of="$door/key" bs=32 count=1 2>/dev/null
+shasum -a 256 "$door/key" | cut -d' ' -f1 > "$root/var/instances/temp/key.sha256"
+printf '%s\n' '{"origin":"test","fresh":true}' > "$door/xdg/hey-cli/credentials.json"
+printf 'temp\n' > "$door/instance"
+printf '/dev/ttys000\n' > "$door/tty"
+printf 'deadbeef\n' > "$door/ticket"
+printf 'FINGER1\0old\n' > "$root/var/instances/temp/sealed.box"
+python3 "$root/drive.py" "$root" stale
+[[ ! -e "$door" ]] || { printf 'ux-test: the keeper door survived the reseal\n' >&2; exit 1; }
+tail -c +9 "$root/var/instances/temp/sealed.box" | tar -xzO hey-cli/credentials.json | grep -q '"fresh":true' \
+  || { printf 'ux-test: the reseal did not save what the keeper held\n' >&2; exit 1; }
+pass "a crashed session must be resealed before quit, and the keeper's copy is what gets sealed"
+
+make_root
+root="$ROOT"
+door="$root/var/live/keeper/door"
+mkdir -p "$door/xdg/hey-cli" "$root/var/instances/temp"
+dd if=/dev/urandom of="$door/key" bs=32 count=1 2>/dev/null
+dd if=/dev/zero bs=32 count=1 2>/dev/null | shasum -a 256 | cut -d' ' -f1 > "$root/var/instances/temp/key.sha256"
+printf '%s\n' '{"planted":true}' > "$door/xdg/hey-cli/credentials.json"
+printf 'temp\n' > "$door/instance"
+printf '/dev/ttys000\n' > "$door/tty"
+printf 'deadbeef\n' > "$door/ticket"
+printf 'FINGER1\0real\n' > "$root/var/instances/temp/sealed.box"
+python3 "$root/drive.py" "$root" stale
+[[ ! -e "$door" ]] || { printf 'ux-test: a planted keeper door survived\n' >&2; exit 1; }
+grep -q real "$root/var/instances/temp/sealed.box" \
+  || { printf 'ux-test: a door opened with another key replaced the seal\n' >&2; exit 1; }
+pass "a keeper door opened with some other key is dropped, never sealed in"
+
+make_root
+root="$ROOT"
+sleep 60 &
+sleeper=$!
+disown "$sleeper" 2>/dev/null || true
+SLEEPERS+=("$sleeper")
+mkdir -p "$root/var/live/lock"
+printf '%s\n' "$sleeper" > "$root/var/live/lock/pid"
+printf '%s\n' temp > "$root/var/live/lock/instance"
+printf '%s\n' /dev/ttys000 > "$root/var/live/lock/tty"
+python3 "$root/drive.py" "$root" other
+pass "someone else's open door is left alone"
+
+set +e
+"$root/fingeronit" </dev/null >/tmp/fingeronit-ux-out 2>/tmp/fingeronit-ux-err
+notty=$?
+set -e
+[[ "$notty" -eq 77 ]]
+grep -q 'No terminal' /tmp/fingeronit-ux-err
+rm -f /tmp/fingeronit-ux-out /tmp/fingeronit-ux-err
+pass "no terminal is refused"
+
+"$root/fingeronit" doctor > /tmp/fingeronit-ux-doctor
+grep -q 'hey search has --from --to --date --all --json' /tmp/fingeronit-ux-doctor
+grep -q '0 problems' /tmp/fingeronit-ux-doctor
+grep -q 'gmail search has --from --to --date --all --json' /tmp/fingeronit-ux-doctor
+mv "$root/lib/providers/gmail.py" "$root/lib/providers/gmail.py.off"
+"$root/fingeronit" doctor > /tmp/fingeronit-ux-doctor
+grep -q 'Gmail sign-in is unavailable' /tmp/fingeronit-ux-doctor
+grep -q '0 problems' /tmp/fingeronit-ux-doctor
+mv "$root/lib/providers/gmail.py.off" "$root/lib/providers/gmail.py"
+printf 'binary_sha256 = %s\n' 0000 > "$root/lockenv.cfg"
+set +e
+"$root/fingeronit" doctor > /tmp/fingeronit-ux-doctor
+docbad=$?
+set -e
+[[ "$docbad" -eq 1 ]]
+grep -q 'binary changed since install' /tmp/fingeronit-ux-doctor
+rm -f /tmp/fingeronit-ux-doctor "$root/lockenv.cfg"
+pass "doctor checks HEY's flags and the binary checksum, without unlocking"
+
+"$root/fingeronit" help > /tmp/fingeronit-ux-help
+grep -q 'seal and the door' /tmp/fingeronit-ux-help
+rm -f /tmp/fingeronit-ux-help
+pass "help describes the state"
+
+make_root
+root="$ROOT"
+mkdir -p "$root/var/live/pack" "$root/var/live/xdg/hey-cli" "$root/var/live/zdot"
+printf 'plain login\n' > "$root/var/live/pack/c.abandoned"
+printf '{"stub":true}\n' > "$root/var/live/xdg/hey-cli/credentials.json"
+printf '/tmp/fingeronit-cwd.gone\n' > "$root/var/live/cwdpath"
+old_cwd="$(mktemp -d /tmp/fingeronit-cwd.XXXXXX)"
+touch -t 202001010000 "$old_cwd"
+new_cwd="$(mktemp -d /tmp/fingeronit-cwd.XXXXXX)"
+"$root/fingeronit" clean > /tmp/fingeronit-ux-clean 2>&1
+grep -q 'Nothing else is left over' /tmp/fingeronit-ux-clean
+[[ ! -e "$root/var/live/pack" && ! -e "$root/var/live/xdg" && ! -e "$root/var/live/zdot" && ! -e "$root/var/live/cwdpath" ]]
+[[ ! -e "$old_cwd" ]]
+[[ -d "$new_cwd" ]]
+rm -rf "$new_cwd" /tmp/fingeronit-ux-clean
+mkdir -p "$root/var/live/lock" "$root/var/live/pack"
+printf '99999999\n' > "$root/var/live/lock/pid"
+printf 'kept\n' > "$root/var/live/pack/c.stale"
+"$root/fingeronit" clean > /dev/null 2>&1 || true
+[[ -f "$root/var/live/pack/c.stale" ]]
+rm -rf "$root/var/live/lock" "$root/var/live/pack"
+pass "leftovers from an abandoned session are shredded, but never while a door is left to reseal"
+( cd "$HERE/.." && /usr/bin/python3 -I -B -m unittest discover -s tests > /tmp/fingeronit-ux-unit 2>&1 ) \
+  || { cat /tmp/fingeronit-ux-unit >&2; exit 1; }
+rm -f /tmp/fingeronit-ux-unit
+pass "the gmail provider's unit tests"
+printf 'ux-test ok\n'

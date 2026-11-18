@@ -1,0 +1,44 @@
+# Source this file. It does not unlock anything.
+#   source /path/to/fingeronit/bin/activate
+# Leave it with: deactivate
+
+if [ -n "${BASH_VERSION:-}" ]; then
+  _fingeronit_source="${BASH_SOURCE[0]}"
+elif [ -n "${ZSH_VERSION:-}" ]; then
+  _fingeronit_source=$(eval 'printf %s "${(%):-%x}"')
+else
+  printf '%s\n' "fingeronit: source bin/activate from bash or zsh" >&2
+  return 1
+fi
+
+_fingeronit_bin=$(CDPATH= cd -- "$(dirname "$_fingeronit_source")" && pwd)
+_fingeronit_root=$(CDPATH= cd -- "$_fingeronit_bin/.." && pwd)
+
+if [ -n "${FINGERONIT_ROOT:-}" ] && [ -n "${_fingeronit_old_path:-}" ]; then
+  PATH="$_fingeronit_old_path"
+fi
+
+_fingeronit_old_path="$PATH"
+PATH="$_fingeronit_bin:$PATH"
+FINGERONIT_ROOT="$_fingeronit_root"
+export FINGERONIT_ROOT
+
+hey() {
+  printf '%s\n' "fingeronit: the mail door is not open in this shell." >&2
+  printf '%s\n' "In your own terminal: fingeronit session" >&2
+  return 77
+}
+
+deactivate() {
+  if [ -n "${_fingeronit_old_path:-}" ]; then
+    PATH="$_fingeronit_old_path"
+  fi
+  unset FINGERONIT_ROOT _fingeronit_old_path _fingeronit_root _fingeronit_bin _fingeronit_source
+  if [ -n "${ZSH_VERSION:-}" ]; then
+    unfunction hey deactivate 2>/dev/null || true
+  else
+    unset -f hey deactivate
+  fi
+}
+
+unset _fingeronit_source _fingeronit_bin

@@ -1,0 +1,138 @@
+#!/bin/bash
+# Build fingeronit's pieces from source. Run it once after cloning:
+#
+#   bin/build             compile finger-touch and finger-seal, fetch the pinned hey
+#   bin/build --no-hey    compile only, skip the download
+#   bin/build --force     allow rebuilding an existing bin/finger-touch (see below)
+#
+# Needs macOS, the Xcode command line tools (swiftc, codesign), and curl.
+set -euo pipefail
+umask 022
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+say() { printf '%s\n' "$1"; }
+die() { printf 'build: %s\n' "$1" >&2; exit 1; }
+
+FORCE=0
+FETCH=1
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=1 ;;
+    --no-hey) FETCH=0 ;;
+    -h|--help)
+      cat << 'USAGE'
+Usage: bin/build [--force] [--no-hey]
+
+Builds what a fresh clone lacks:
+  bin/finger-touch     compiled from lib/FingerTouch.swift, ad-hoc signed
+  bin/finger-seal   compiled from lib/FingerSeal.swift, ad-hoc signed
+  libexec/hey       the HEY CLI release pinned in lockenv.cfg, checksum-verified
+
+  --force    rebuild bin/finger-touch even though it exists. finger-touch keeps its
+             key in your login keychain, and the keychain trusts that exact
+             signed binary. A rebuilt binary is a different program to it,
+             so the old key becomes unreachable and sealed logins are lost.
+  --no-hey   skip the download of hey
+  --help     show this
+USAGE
+      exit 0
+      ;;
+    *) die "unknown option: $arg (try --help)" ;;
+  esac
+done
+
+[[ "$(uname -s)" == Darwin ]] || die "fingeronit only runs on macOS."
+for tool in swiftc codesign curl shasum tar; do
+  command -v "$tool" > /dev/null 2>&1 || die "$tool not found. For swiftc and codesign, run: xcode-select --install"
+done
+
+HERE="$(cd "$(dirname "$0")/.." && pwd -P)"
+cd "$HERE"
+for f in lib/FingerTouch.swift lib/FingerSeal.swift lockenv.cfg; do
+  [[ -f "$f" ]] || die "missing $HERE/$f. Is this a complete checkout?"
+done
+
+cfg() { awk -F' *= *' -v k="$1" '$1 == k {print $2; exit}' lockenv.cfg; }
+
+# finger-touch holds an AES key in the login keychain, trusted by this binary's signature.
+if [[ -e bin/finger-touch && "$FORCE" -ne 1 ]]; then
+  die "bin/finger-touch already exists, so it is not being rebuilt.
+  It keeps its key in your login keychain, and the keychain trusts that exact
+  signed binary. A rebuild is a new program to the keychain: it can no longer
+  reach its key, and anything sealed with the old key is lost.
+  Rebuild only if you have not used fingeronit yet, or accept the loss: bin/build --force"
+fi
+if [[ -e bin/finger-touch && "$FORCE" -eq 1 ]]; then
+  say "WARNING: rebuilding bin/finger-touch. The old key in your keychain will no longer open for the new binary."
+fi
+
+SCRATCH="$(mktemp -d /tmp/fingeronit-build.XXXXXX)"
+trap 'rm -rf "$SCRATCH"' EXIT
+
+compile() {
+  local src="$1" name="$2" dest="$3"
+  swiftc -O "$src" -o "$SCRATCH/$name" 2> "$SCRATCH/$name.log" \
+    || { cat "$SCRATCH/$name.log" >&2; die "swiftc failed on $src"; }
+  codesign -s - -f -o runtime "$SCRATCH/$name" 2> "$SCRATCH/$name.sign" \
+    || { cat "$SCRATCH/$name.sign" >&2; die "codesign failed on $name"; }
+  chmod 0500 "$SCRATCH/$name"
+  [[ ! -e "$dest" ]] || chmod u+w "$dest"
+  mv -f "$SCRATCH/$name" "$dest"
+  say "Built $dest"
+}
+
+mkdir -p bin libexec
+compile lib/FingerTouch.swift finger-touch bin/finger-touch
+compile lib/FingerSeal.swift finger-seal bin/finger-seal
+
+if [[ "$FETCH" -eq 1 ]]; then
+  version="$(cfg hey_version)"
+  asset="$(cfg hey_asset)"
+  want_asset="$(cfg asset_sha256)"
+  want_bin="$(cfg binary_sha256)"
+  [[ -n "$version" && -n "$asset" && -n "$want_asset" && -n "$want_bin" ]] \
+    || die "lockenv.cfg is missing hey_version, hey_asset, asset_sha256 or binary_sha256."
+  [[ "$asset" =~ ^[A-Za-z0-9._-]+$ ]] || die "hey_asset in lockenv.cfg looks wrong."
+  [[ "$version" =~ ^[0-9][A-Za-z0-9._-]*$ ]] || die "hey_version in lockenv.cfg looks wrong."
+
+  case "$(uname -m)" in
+    arm64)  arch=arm64 ;;
+    x86_64) arch=amd64 ;;
+    *) die "unsupported CPU: $(uname -m)" ;;
+  esac
+  if [[ "$asset" != *"_darwin_${arch}."* ]]; then
+    die "lockenv.cfg pins $asset, which is not for this Mac ($(uname -m)).
+  To use another build, edit lockenv.cfg: set hey_asset to the darwin_${arch} file on
+  https://github.com/basecamp/hey-cli/releases/tag/v$version, set asset_sha256 to that
+  file's sha256 (shown beside it on the release page), then set binary_sha256 to the
+  sha256 of the hey inside it (extract it and run: shasum -a 256 hey). Run bin/build again."
+  fi
+
+  say "Downloading $asset"
+  curl -fL --proto '=https' --tlsv1.2 -sS -o "$SCRATCH/$asset" \
+    "https://github.com/basecamp/hey-cli/releases/download/v$version/$asset" \
+    || die "download failed."
+  got="$(shasum -a 256 "$SCRATCH/$asset" | cut -d' ' -f1)"
+  [[ "$got" == "$want_asset" ]] || die "downloaded file does not match asset_sha256 in lockenv.cfg. Nothing installed."
+  say "Archive checksum ok"
+
+  mkdir "$SCRATCH/x"
+  tar -xzf "$SCRATCH/$asset" -C "$SCRATCH/x" hey 2> /dev/null \
+    || tar -xzf "$SCRATCH/$asset" -C "$SCRATCH/x" ./hey \
+    || die "no hey binary in the archive."
+  [[ -f "$SCRATCH/x/hey" && ! -L "$SCRATCH/x/hey" ]] || die "the archive's hey is not a plain file."
+  got="$(shasum -a 256 "$SCRATCH/x/hey" | cut -d' ' -f1)"
+  [[ "$got" == "$want_bin" ]] || die "hey does not match binary_sha256 in lockenv.cfg. Nothing installed."
+  say "Binary checksum ok"
+
+  chmod 0500 "$SCRATCH/x/hey"
+  [[ ! -e libexec/hey ]] || chmod u+w libexec/hey
+  mv -f "$SCRATCH/x/hey" libexec/hey
+  say "Installed libexec/hey (v$version)"
+else
+  say "Skipped hey (--no-hey). Run bin/build again without it to fetch libexec/hey."
+fi
+
+say ""
+say "Next: bin/fingeronit doctor"
+say "Optional: sudo bin/install-keeper"

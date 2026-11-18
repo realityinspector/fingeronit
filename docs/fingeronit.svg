@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 360" width="880" height="360" role="img" aria-labelledby="t d">
+  <title id="t">How fingeronit locks your mail CLI</title>
+  <desc id="d">You ask fingeronit for mail in your terminal. Touch ID releases a key. The sealed login is opened straight into a keeper that runs as a separate hidden user. The keeper runs hey or gmail for your terminal only. An agent running as you reaches neither the sealed login nor the keeper.</desc>
+  <style>
+    .bg { fill: #ffffff; }
+    .box { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1.5; }
+    .lock { fill: #fff8e6; stroke: #d4a72c; stroke-width: 1.5; }
+    .keep { fill: #eef6ff; stroke: #0969da; stroke-width: 1.5; }
+    .agent { fill: #fff1f0; stroke: #cf222e; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .zone { fill: none; stroke: #8c959f; stroke-width: 1; stroke-dasharray: 3 4; }
+    .h { font: 600 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2328; }
+    .s { font: 12.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #57606a; }
+    .z { font: 600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #8c959f; letter-spacing: .08em; }
+    .flow { stroke: #1f2328; stroke-width: 1.8; fill: none; }
+    .head { fill: #1f2328; }
+    .no { stroke: #cf222e; stroke-width: 1.8; fill: none; }
+    .nohead { fill: #cf222e; }
+    .x { stroke: #cf222e; stroke-width: 3; stroke-linecap: round; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .box { fill: #161b22; stroke: #30363d; }
+      .lock { fill: #2b2111; stroke: #bb8009; }
+      .keep { fill: #0c2d6b; stroke: #388bfd; }
+      .agent { fill: #2d1214; stroke: #f85149; }
+      .h { fill: #e6edf3; }
+      .s { fill: #9198a1; }
+      .flow { stroke: #e6edf3; }
+      .head { fill: #e6edf3; }
+      .no { stroke: #f85149; }
+      .nohead { fill: #f85149; }
+      .x { stroke: #f85149; }
+    }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="head" d="M0 0 L10 5 L0 10 z"/></marker>
+    <marker id="r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="nohead" d="M0 0 L10 5 L0 10 z"/></marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="880" height="360" rx="12"/>
+
+  <!-- zones -->
+  <rect class="zone" x="16" y="28" width="520" height="316" rx="10"/>
+  <text class="z" x="30" y="48">YOUR USER</text>
+  <rect class="zone" x="552" y="28" width="312" height="200" rx="10"/>
+  <text class="z" x="566" y="48">HIDDEN USER _fingeronit</text>
+
+  <!-- 1 terminal -->
+  <rect class="box" x="36" y="66" width="150" height="76" rx="8"/>
+  <text class="h" x="52" y="96">1  Your terminal</text>
+  <text class="s" x="52" y="118">fingeronit: export,</text>
+  <text class="s" x="52" y="134">browse, run, session</text>
+
+  <!-- 2 touch id -->
+  <rect class="lock" x="216" y="66" width="150" height="76" rx="8"/>
+  <text class="h" x="232" y="96">2  Touch ID</text>
+  <text class="s" x="232" y="118">finger-touch releases</text>
+  <text class="s" x="232" y="134">one key, per unlock</text>
+
+  <!-- sealed box -->
+  <rect class="lock" x="396" y="66" width="124" height="76" rx="8"/>
+  <text class="h" x="412" y="96">Sealed login</text>
+  <text class="s" x="412" y="118">AES-GCM on disk,</text>
+  <text class="s" x="412" y="134">never plaintext</text>
+
+  <!-- 3 keeper -->
+  <rect class="keep" x="572" y="66" width="272" height="76" rx="8"/>
+  <text class="h" x="588" y="96">3  Keeper</text>
+  <text class="s" x="588" y="118">holds the open login, runs it only</text>
+  <text class="s" x="588" y="134">for your ticket and your terminal</text>
+
+  <!-- 4 hey -->
+  <rect class="box" x="572" y="160" width="272" height="52" rx="8"/>
+  <text class="h" x="588" y="191">4  hey or gmail  →  your mail</text>
+
+  <!-- flow arrows -->
+  <path class="flow" d="M186 104 H210" marker-end="url(#a)"/>
+  <path class="flow" d="M366 104 H390" marker-end="url(#a)"/>
+  <path class="flow" d="M520 104 H566" marker-end="url(#a)"/>
+  <path class="flow" d="M708 142 V154" marker-end="url(#a)"/>
+  <!-- results back to terminal -->
+  <path class="flow" d="M572 186 H111 V148" marker-end="url(#a)"/>
+  <text class="s" x="300" y="178">results, in your terminal only</text>
+
+  <!-- agent -->
+  <rect class="agent" x="36" y="256" width="236" height="72" rx="8"/>
+  <text class="h" x="52" y="286">An agent running as you</text>
+  <text class="s" x="52" y="308">no fingerprint, no ticket</text>
+
+  <path class="no" d="M272 272 C380 272, 458 220, 458 148" marker-end="url(#r)"/>
+  <line class="x" x1="397" y1="229" x2="413" y2="245"/>
+  <line class="x" x1="413" y1="229" x2="397" y2="245"/>
+  <text class="s" x="390" y="240" text-anchor="end">cannot open the seal</text>
+  <path class="no" d="M272 304 C450 304, 600 290, 640 216" marker-end="url(#r)"/>
+  <line class="x" x1="500" y1="280" x2="516" y2="296"/>
+  <line class="x" x1="516" y1="280" x2="500" y2="296"/>
+  <text class="s" x="560" y="300">cannot read the keeper or use it</text>
+  <text class="s" x="560" y="318">(it can only ask the door to close)</text>
+</svg>

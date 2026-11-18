@@ -1,0 +1,3233 @@
+#!/bin/bash
+# fingeronit: a finger on every email action.
+# One lock in front of a mail CLI (HEY or Gmail). The provider signs you in;
+# this decides when that login exists on disk. It opens only in your terminal,
+# and only after Touch ID (or your Mac password).
+set -euo pipefail
+umask 077
+
+SELF="$0"
+if [[ "$SELF" != */* ]]; then
+  SELF="$(command -v "$SELF" 2>/dev/null || printf '%s' "$0")"
+fi
+if [[ -L "$SELF" ]]; then
+  _link="$(readlink "$SELF")"
+  if [[ "$_link" != /* ]]; then
+    _link="$(cd "$(dirname "$SELF")" && pwd)/$_link"
+  fi
+  SELF="$_link"
+fi
+# Physical paths: a symlink named like a test folder must not pass for one.
+BIN="$(cd "$(dirname "$SELF")" && pwd -P)"
+ROOT="$(cd "$BIN/.." && pwd -P)"
+# A relative name shows up in the process list without this directory, and the
+# fingerprint prompt then looks like a stranger asked. Re-exec on the real path.
+if [[ "$0" != "$BIN/fingeronit" ]]; then
+  exec "$BIN/fingeronit" "$@"
+fi
+unset SELF _link
+REAL="$ROOT/libexec/hey"
+TOUCH="$BIN/finger-touch"
+LIVE="$ROOT/var/live"
+INSTANCES="$ROOT/var/instances"
+DEFAULT_NAME="temp"
+FINGERONIT_VERSION="0.1.0"
+SELF_MTIME="$(stat -f %m "$BIN/fingeronit" 2>/dev/null || printf 0)"
+EXAMPLE_SENDER="news@example.com"
+EXPORT_AUTO=0
+EXPORT_SENDERS=()
+EXPORT_MODE=""
+EXPORT_MODE_CUR="from"
+EXPORT_DAYS=""
+EXPORT_KIND=""
+EXPORT_DEST=""
+EXPORT_OPEN=0
+CLEAN_LIVE=0
+IN_MENU=0
+PICKER_STTY=""
+KEEPER_SYS="/usr/local/libexec/fingeronit/keeper"
+KEEPER_LOCAL="$ROOT/lib/keeper"
+SEAL_LOCAL="$BIN/finger-seal"
+HB_TICKET=""
+KEEPER_ORPHAN=0
+EXPORT_HOME="$HOME/fingeronit-export"
+FAREWELL_ON=0
+CAUGHT=""
+ASKING=0
+ASK_CANCEL=0
+SECURITY="/usr/bin/security"
+# The test harness copies fingeronit to /tmp/fingeronit-ux.* and may swap in stubs.
+# ROOT is a physical path, so only a real copy living there gets the stubs,
+# never your own install reached through a symlink.
+case "$ROOT" in
+  /tmp/fingeronit-ux.*|/private/tmp/fingeronit-ux.*)
+    [[ -n "${FINGERONIT_SECURITY:-}" ]] && SECURITY="$FINGERONIT_SECURITY"
+    ;;
+esac
+
+die() {
+  printf 'fingeronit: %s\n' "$1" >&2
+  exit "${2:-1}"
+}
+
+# From the menu, a mistake returns to the choices. From a one-shot command, it exits.
+fail() {
+  printf 'fingeronit: %s\n' "$1" >&2
+  if [[ "$IN_MENU" -eq 1 ]]; then
+    return "${2:-1}"
+  fi
+  exit "${2:-1}"
+}
+
+require_tty() {
+  if [[ -t 0 && -t 1 && -t 2 ]]; then
+    return 0
+  fi
+  die "refused. No terminal on this side of the door. Run it in Terminal yourself." 77
+}
+
+valid_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]]
+}
+
+instance_dir() { printf '%s/%s' "$INSTANCES" "$1"; }
+account_for() { printf 'instance/%s' "$1"; }
+
+need_name() {
+  valid_name "$1" || die "instance name must be letters, numbers, dot, dash, or underscore"
+}
+
+# ---- providers --------------------------------------------------------------
+# The one provider table. lib/keeper carries the same table for what runs under
+# the keeper; keep the two in step. An instance names its provider in
+# var/instances/NAME/provider ("hey" or "gmail"); no file means hey.
+#
+#   hey    command: $ROOT/libexec/hey
+#          config dir in XDG_CONFIG_HOME: hey-cli     contact thread lists: yes
+#   gmail  command: /usr/bin/python3 -I $ROOT/lib/providers/gmail.py
+#          config dir in XDG_CONFIG_HOME: fingeronit-gmail     contact thread lists: no
+# Under the keeper the commands are /usr/local/libexec/fingeronit/hey and
+# /usr/bin/python3 -I /usr/local/libexec/fingeronit/gmail.py.
+# Sign-in is "auth login" for both.
+GMAIL_PY="$ROOT/lib/providers/gmail.py"
+PYTHON3="/usr/bin/python3"
+PROVIDER=hey
+PCMD=()
+
+valid_provider() {
+  case "$1" in hey|gmail) return 0 ;; esac
+  return 1
+}
+
+# Sets PROVIDER and PCMD (the command words).
+provider_set() {
+  PROVIDER="$1"
+  case "$1" in
+    gmail) PCMD=("$PYTHON3" -I "$GMAIL_PY") ;;
+    *) PROVIDER=hey; PCMD=("$REAL") ;;
+  esac
+}
+
+provider_title() { [[ "$PROVIDER" == gmail ]] && printf 'Gmail' || printf 'HEY'; }
+provider_cmdname() { [[ "$PROVIDER" == gmail ]] && printf 'gmail' || printf 'hey'; }
+provider_cfgdir() { [[ "$PROVIDER" == gmail ]] && printf 'fingeronit-gmail' || printf 'hey-cli'; }
+provider_has_contacts() { [[ "$PROVIDER" == hey ]]; }
+
+provider_present() {
+  if [[ "$PROVIDER" == gmail ]]; then
+    [[ -f "$GMAIL_PY" && -x "$PYTHON3" ]]
+  else
+    [[ -x "$REAL" ]]
+  fi
+}
+
+# Points PROVIDER at the one this instance was signed in with.
+provider_load() {
+  local p=hey
+  if valid_name "$1" && [[ -f "$(instance_dir "$1")/provider" ]]; then
+    p="$(head -n 1 "$(instance_dir "$1")/provider" 2>/dev/null || printf hey)"
+    valid_provider "$p" || p=hey
+  fi
+  provider_set "$p"
+}
+
+need_tools() {
+  provider_present || die "$([[ "$PROVIDER" == gmail ]] && printf 'lib/providers/gmail.py is missing' || printf 'libexec/hey is missing')"
+  [[ -x "$TOUCH" ]] || die "bin/finger-touch is missing. Run bin/build first."
+}
+
+shred_path() {
+  local target="$1"
+  [[ -e "$target" || -L "$target" ]] || return 0
+  if [[ -L "$target" ]]; then
+    rm -f "$target"
+    return 0
+  fi
+  if [[ -f "$target" ]]; then
+    local size
+    size="$(wc -c < "$target" | tr -d ' ')"
+    if [[ "${size:-0}" -gt 0 ]]; then
+      dd if=/dev/urandom of="$target" bs=4096 count="$((size / 4096 + 1))" conv=notrunc status=none 2>/dev/null || true
+    fi
+    rm -f "$target"
+    return 0
+  fi
+  if [[ -d "$target" ]]; then
+    local f
+    while IFS= read -r -d '' f; do
+      if [[ -L "$f" || -f "$f" ]]; then
+        shred_path "$f"
+      fi
+    done < <(find "$target" -mindepth 1 -print0)
+    rm -rf "$target"
+  fi
+}
+
+# ---- the keeper ----------------------------------------------------------
+# An open login is handed to lib/keeper. Installed with sudo bin/install-keeper,
+# the keeper runs as the hidden user _fingeronit and keeps the login where your
+# user cannot read it. Not installed, the same keeper runs as you under
+# var/live/keeper. Either way the provider only runs for the ticket this fingeronit got
+# when the door opened, from this terminal.
+keeper_installed() {
+  case "$ROOT" in
+    /tmp/fingeronit-ux.*|/private/tmp/fingeronit-ux.*)
+      [[ "${FINGERONIT_KEEPER_LOCAL:-0}" == 1 ]] && return 1
+      ;;
+  esac
+  [[ -x "$KEEPER_SYS" && -f /etc/sudoers.d/fingeronit ]]
+}
+
+keeper() {
+  if keeper_installed; then
+    sudo -n -u _fingeronit "$KEEPER_SYS" "$@"
+  else
+    FINGERONIT_KEEPER_HOME="$LIVE/keeper" FINGERONIT_KEEPER_HEY="$REAL" \
+      FINGERONIT_KEEPER_GMAIL="$GMAIL_PY" FINGERONIT_KEEPER_SEAL="$SEAL_LOCAL" /bin/bash "$KEEPER_LOCAL" "$@"
+  fi
+}
+
+keeper_label() {
+  if keeper_installed; then
+    printf 'separate user _fingeronit'
+  else
+    printf 'your own user (sudo bin/install-keeper moves it out of reach)'
+  fi
+}
+
+keeper_is_open() {
+  local st
+  st="$(keeper state 2>/dev/null || true)"
+  [[ "$st" == open* ]]
+}
+
+# A door the keeper holds that no fingeronit lock points at.
+refresh_orphan() {
+  KEEPER_ORPHAN=0
+  if [[ ! -d "$LIVE/lock" ]] && keeper_is_open; then
+    KEEPER_ORPHAN=1
+  fi
+  return 0
+}
+
+# Ask the keeper to seal what it holds and write it back as this instance's
+# seal. The keeper answers with the hash of the key it sealed with. Only a door
+# opened with this instance's own key may replace its seal.
+keeper_reseal() {
+  local name="$1" dir out want got st
+  mkdir -p "$LIVE/pack"
+  chmod 700 "$LIVE/pack"
+  out="$LIVE/pack/close.$$"
+  set +e
+  keeper close > "$out" 2> "$LIVE/pack/close.err"
+  st=$?
+  set -e
+  if [[ "$st" -eq 3 ]]; then
+    rm -f "$out" "$LIVE/pack/close.err"
+    return 0
+  fi
+  if [[ "$st" -ne 0 || ! -s "$out" ]]; then
+    cat "$LIVE/pack/close.err" >&2 2>/dev/null || true
+    rm -f "$out" "$LIVE/pack/close.err"
+    return 1
+  fi
+  rm -f "$LIVE/pack/close.err"
+  got="$(head -n 1 "$out")"
+  want=""
+  if valid_name "$name"; then
+    dir="$(instance_dir "$name")"
+    want="$(cat "$dir/key.sha256" 2>/dev/null || true)"
+  fi
+  if [[ -z "$want" || "$got" != "$want" ]]; then
+    rm -f "$out"
+    printf 'fingeronit: the keeper held a login that was not opened with this box'"'"'s key. It was dropped, not saved.\n' >&2
+    return 0
+  fi
+  tail -c +$(( ${#got} + 2 )) "$out" > "$dir/sealed.box.new"
+  rm -f "$out"
+  if [[ "$(head -c 7 "$dir/sealed.box.new")" != "FINGER1" ]]; then
+    rm -f "$dir/sealed.box.new"
+    printf 'fingeronit: the keeper'"'"'s seal had the wrong shape. The old seal was kept.\n' >&2
+    return 1
+  fi
+  chmod 600 "$dir/sealed.box.new"
+  mv -f "$dir/sealed.box.new" "$dir/sealed.box"
+}
+
+audit() {
+  local name="$1"
+  shift
+  local dir line ts ttyname arg
+  dir="$(instance_dir "$name")"
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  ttyname="$(tty 2>/dev/null || printf 'none')"
+  line="$ts tty=$ttyname"
+  for arg in "$@"; do
+    line="$line $(printf '%q' "$arg")"
+  done
+  touch "$dir/audit.log"
+  chmod 600 "$dir/audit.log"
+  printf '%s\n' "$line" >> "$dir/audit.log"
+}
+
+# gmail may do only this: search, thread read, attachment list and save, draft
+# list and show, auth status, version, help. lib/keeper carries the same rule.
+gmail_allowed() {
+  local a="${1:-}" b="${2:-}"
+  case "$a" in
+    search|help|version|--help|-h|--version) return 0 ;;
+    thread) [[ "$b" == read || "$b" == --help || "$b" == -h ]] ;;
+    attachment) [[ "$b" == list || "$b" == save || "$b" == --help || "$b" == -h ]] ;;
+    draft) [[ "$b" == list || "$b" == show || "$b" == --help || "$b" == -h ]] ;;
+    auth) [[ "$b" == status ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+refuse_shape() {
+  if [[ "$PROVIDER" == gmail ]]; then
+    gmail_allowed "$@" && return 1
+    return 0
+  fi
+  # Find the command words the way hey's parser does: global flags can come
+  # first, and some of them take a value.
+  local arg skip=0
+  local -a words=()
+  for arg in "$@"; do
+    if [[ "$skip" -eq 1 ]]; then skip=0; continue; fi
+    case "$arg" in
+      --mcp|--agent|--token|--cookie|--password) return 0 ;;
+      --base-url|--base-url=*) return 0 ;;
+      -v|-vv|-vvv|--verbose|--verbose=*) return 0 ;;
+      --account|--jq|--profile|-P) skip=1 ;;
+      --) ;;
+      -*) ;;
+      *) words+=("$arg") ;;
+    esac
+  done
+  [[ "${#words[@]}" -gt 0 ]] || return 1
+  case "${words[0]}" in
+    setup|skill|mcp|plugin|commands|upgrade|shell-completion|login|logout|config)
+      return 0
+      ;;
+    auth)
+      [[ "${words[1]:-}" == "status" ]] || return 0
+      ;;
+  esac
+  return 1
+}
+
+needs_credential() {
+  case "${1:-}" in
+    ""|help|version|--help|--version|-h|-V) return 1 ;;
+  esac
+  return 0
+}
+
+lock_pid() { cat "$LIVE/lock/pid" 2>/dev/null || true; }
+lock_instance() { cat "$LIVE/lock/instance" 2>/dev/null || true; }
+lock_tty() { cat "$LIVE/lock/tty" 2>/dev/null || true; }
+
+# True when this fingeronit was started from inside the session that holds the door:
+# the lock's pid is one of our ancestors, and we share its terminal.
+lock_is_ours() {
+  local target here pid n=0
+  target="$(lock_pid)"
+  [[ -n "$target" && "$target" != "$$" ]] || return 1
+  here="$(tty 2>/dev/null || true)"
+  [[ -n "$here" && "$here" == "$(lock_tty)" ]] || return 1
+  pid="$PPID"
+  while [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 && "$n" -lt 32 ]]; do
+    [[ "$pid" == "$target" ]] && return 0
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    n=$((n + 1))
+  done
+  return 1
+}
+
+lock_is_stale() {
+  local pid
+  pid="$(lock_pid)"
+  [[ -n "$pid" ]] || return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
+door_state() {
+  if [[ ! -d "$LIVE/lock" ]]; then
+    if [[ "$KEEPER_ORPHAN" -eq 1 ]]; then
+      printf 'stale'
+    else
+      printf 'shut'
+    fi
+    return
+  fi
+  if lock_is_stale; then
+    printf 'stale'
+    return
+  fi
+  if [[ "$(lock_pid)" == "$$" ]]; then
+    printf 'self'
+    return
+  fi
+  if lock_is_ours; then
+    printf 'mine'
+    return
+  fi
+  printf 'other'
+}
+
+door_label() {
+  case "$(door_state)" in
+    shut) printf 'shut' ;;
+    stale) printf 'stale, left open' ;;
+    self) printf 'open' ;;
+    mine) printf 'open, this session (%s)' "$(lock_instance)" ;;
+    other) printf 'open by pid %s on %s' "$(lock_pid)" "$(lock_tty)" ;;
+  esac
+}
+
+seal_state() {
+  if [[ -f "$(instance_dir "$1")/sealed.box" ]]; then
+    printf 'yes'
+  else
+    printf 'no'
+  fi
+}
+
+warn_if_left_open() {
+  [[ -d "$LIVE/lock" ]] || return 0
+  if [[ "$(lock_pid)" == "$$" ]]; then
+    close_door || exit 1
+    return 0
+  fi
+  if lock_is_ours; then
+    fail "you are inside session $(lock_instance). Type exit at the session prompt to seal it first." || return $?
+    return 0
+  fi
+  if lock_is_stale; then
+    fail "a session died and left the box open. Reseal it before opening again." || return $?
+    return 0
+  fi
+  fail "already open (pid $(lock_pid), instance $(lock_instance)). Exit that one first." || return $?
+}
+
+acquire() {
+  local name="$1"
+  warn_if_left_open || return $?
+  mkdir -p "$LIVE"
+  chmod 700 "$LIVE"
+  mkdir "$LIVE/lock"
+  printf '%s\n' "$$" > "$LIVE/lock/pid"
+  printf '%s\n' "$name" > "$LIVE/lock/instance"
+  tty > "$LIVE/lock/tty" 2>/dev/null || printf 'none\n' > "$LIVE/lock/tty"
+  CLEAN_LIVE=1
+  start_watchdog
+}
+
+# ---- idle timeout ---------------------------------------------------------
+# While the door is open, a watchdog watches this terminal's last keystroke
+# (the tty's access time, the same signal `w` uses; screen output does not
+# count). After idle_minutes with no keys, it hangs up whatever is holding the
+# door, then stops this fingeronit, and the door is resealed on the way out.
+# Long exports beat a heartbeat so writing many threads does not count as idle.
+# idle_minutes lives in lockenv.cfg (0 turns it off). FINGERONIT_IDLE_SECONDS can
+# only make it shorter.
+WATCHDOG_PID=""
+
+idle_seconds() {
+  local m s
+  m="$(awk -F' *= *' '$1 == "idle_minutes" {print $2}' "$ROOT/lockenv.cfg" 2>/dev/null || true)"
+  [[ "$m" =~ ^[0-9]+$ ]] || m=20
+  s=$((10#$m * 60))
+  if [[ "${FINGERONIT_IDLE_SECONDS:-}" =~ ^[0-9]+$ && "$FINGERONIT_IDLE_SECONDS" -gt 0 ]]; then
+    if [[ "$s" -eq 0 || "$FINGERONIT_IDLE_SECONDS" -lt "$s" ]] && [[ "$s" -ne 0 ]]; then
+      s="$FINGERONIT_IDLE_SECONDS"
+    fi
+  fi
+  printf '%s' "$s"
+}
+
+idle_label() {
+  local s="$1"
+  if [[ "$s" -eq 0 ]]; then
+    printf 'off'
+  elif [[ $((s % 60)) -eq 0 ]]; then
+    printf '%s minutes' $((s / 60))
+  else
+    printf '%s seconds' "$s"
+  fi
+}
+
+beat() {
+  [[ -d "$LIVE/lock" ]] && touch "$LIVE/lock/beat" 2>/dev/null
+  return 0
+}
+
+start_watchdog() {
+  local idle
+  idle="$(idle_seconds)"
+  [[ "$idle" -gt 0 ]] || return 0
+  "$BIN/fingeronit" _watchdog "$$" "$(lock_tty)" "$idle" < /dev/null > /dev/null 2>&1 &
+  WATCHDOG_PID=$!
+}
+
+stop_watchdog() {
+  if [[ -n "$WATCHDOG_PID" ]]; then
+    kill "$WATCHDOG_PID" 2>/dev/null || true
+    WATCHDOG_PID=""
+  fi
+}
+
+# Every process under $1, leaving out the subtree of $2 (the watchdog itself).
+descendants() {
+  ps -axo pid=,ppid= | awk -v root="$1" -v skip="$2" '
+    { parent[$1] = $2 }
+    END {
+      for (pid in parent) {
+        q = pid; ok = 0
+        while (q in parent) {
+          if (q == skip) { ok = 0; break }
+          if (parent[q] == root) { ok = 1; break }
+          q = parent[q]
+          if (q <= 1) break
+        }
+        if (ok && pid != skip && pid != root) printf "%s ", pid
+      }
+    }'
+}
+
+watchdog_reseal() {
+  local main="$1" tty="$2" name
+  name="$(lock_instance)"
+  keeper_reseal "$name" > /dev/null 2>&1 || return 0
+  clear_live
+  if [[ -c "$tty" ]]; then
+    printf '\r\n\033[33mfingeronit: pid %s stopped with the door open. Resealed it.\033[0m\r\n' "$main" > "$tty" 2>/dev/null || true
+  fi
+}
+
+cmd_watchdog() {
+  local main="$1" tty="$2" idle="$3" step now last a pids
+  trap - EXIT
+  trap 'exit 0' TERM HUP INT
+  step=$((idle / 4))
+  [[ "$step" -ge 1 ]] || step=1
+  [[ "$step" -le 15 ]] || step=15
+  last="$(date +%s)"
+  while true; do
+    sleep "$step"
+    [[ -d "$LIVE/lock" && "$(lock_pid)" == "$main" ]] || exit 0
+    if ! kill -0 "$main" 2>/dev/null; then
+      # The fingeronit holding the door died without closing it (kill -9, a
+      # crashed terminal). Reseal with the key it left and shred the rest.
+      watchdog_reseal "$main" "$tty"
+      exit 0
+    fi
+    now="$(date +%s)"
+    if [[ -c "$tty" ]]; then
+      a="$(stat -f %a "$tty" 2>/dev/null || printf 0)"
+      [[ "$a" -gt "$last" ]] && last="$a"
+    fi
+    if [[ -f "$LIVE/lock/beat" ]]; then
+      a="$(stat -f %m "$LIVE/lock/beat" 2>/dev/null || printf 0)"
+      [[ "$a" -gt "$last" ]] && last="$a"
+    fi
+    if [[ $((now - last)) -ge "$idle" ]]; then
+      if [[ -c "$tty" ]]; then
+        printf '\r\n\033[33mfingeronit: %s with no keys pressed. Closing the door.\033[0m\r\n' \
+          "$(idle_label "$idle")" > "$tty" 2>/dev/null || true
+      fi
+      keeper stop > /dev/null 2>&1 || true
+      pids="$(descendants "$main" "$$")"
+      # shellcheck disable=SC2086
+      [[ -n "$pids" ]] && kill -HUP $pids 2>/dev/null
+      sleep 5
+      if [[ -d "$LIVE/lock" && "$(lock_pid)" == "$main" ]] && kill -0 "$main" 2>/dev/null; then
+        kill -TERM "$main" 2>/dev/null || true
+        # bash runs the TERM trap only after the command it waits on ends
+        # (a key read, say). Keep hanging those up until fingeronit is out.
+        local n=0
+        while [[ "$n" -lt 15 ]] && kill -0 "$main" 2>/dev/null; do
+          sleep 1
+          pids="$(descendants "$main" "$$")"
+          # shellcheck disable=SC2086
+          [[ -n "$pids" ]] && kill -HUP $pids 2>/dev/null
+          n=$((n + 1))
+        done
+      fi
+      exit 0
+    fi
+  done
+}
+
+clear_live() {
+  local cwd
+  cwd="$(cat "$LIVE/cwdpath" 2>/dev/null || true)"
+  shred_path "$LIVE/xdg"
+  shred_path "$LIVE/home"
+  shred_path "$LIVE/tmp"
+  shred_path "$LIVE/runtime"
+  shred_path "$LIVE/pack"
+  shred_path "$LIVE/zdot"
+  shred_path "$LIVE/key"
+  shred_path "$LIVE/instance"
+  shred_path "$LIVE/cwdpath"
+  [[ -n "$cwd" ]] && shred_path "$cwd"
+  rm -rf "$LIVE/lock"
+}
+
+close_door() {
+  if [[ "${CLEAN_LIVE:-0}" -ne 1 ]]; then
+    return 0
+  fi
+  stop_watchdog
+  local name=""
+  name="$(lock_instance)"
+  if [[ -n "$HB_TICKET" ]] || keeper_is_open; then
+    if ! keeper_reseal "$name"; then
+      printf 'fingeronit: reseal failed. The keeper still holds the login. Run: fingeronit seal-live\n' >&2
+      return 1
+    fi
+  fi
+  HB_TICKET=""
+  CLEAN_LIVE=0
+  clear_live
+}
+
+picker_restore() {
+  if [[ -n "${PICKER_STTY:-}" ]]; then
+    stty "$PICKER_STTY" < /dev/tty 2>/dev/null || true
+    PICKER_STTY=""
+  fi
+}
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM HUP
+  picker_restore
+  close_door || status=1
+  exports_farewell || true
+  exit "$status"
+}
+# Ask one question on the terminal and put the answer in the named variable.
+# A small python reads the line: bash 3.2 cannot cancel its own read on
+# Ctrl-C (it restarts the read after the trap), and python can. Afterwards
+# anything still waiting is thrown away, so a paste that ended in a newline,
+# then Enter, does not answer the next question too.
+# Returns 130 for Ctrl-C, 1 for end of input.
+read -r -d '' ASK_PY << 'PY' || true
+import os, signal, sys, termios
+def stop(*_):
+    raise KeyboardInterrupt
+signal.signal(signal.SIGINT, stop)
+# The prompt goes up only now, so any Ctrl-C you can see it for is caught.
+with open("/dev/tty", "w") as tty:
+    tty.write(sys.argv[1])
+def flush():
+    try:
+        termios.tcflush(0, termios.TCIFLUSH)
+    except termios.error:
+        pass
+try:
+    line = sys.stdin.readline()
+except KeyboardInterrupt:
+    flush()
+    sys.exit(130)
+flush()
+if line == "":
+    sys.exit(1)
+sys.stdout.write(line.rstrip("\r\n"))
+PY
+
+ask() {
+  local __var="$1" __prompt="$2" __line="" __st=0
+  ASK_CANCEL=0
+  ASKING=1
+  __line="$(python3 -I -c "$ASK_PY" "$__prompt" < /dev/tty)" || __st=$?
+  ASKING=0
+  if [[ "$ASK_CANCEL" -eq 1 || "$__st" -eq 130 ]]; then
+    ASK_CANCEL=0
+    printf '\n' > /dev/tty
+    printf -v "$__var" '%s' ""
+    return 130
+  fi
+  __line="${__line//$'\r'/}"
+  __line="${__line#"${__line%%[![:space:]]*}"}"
+  __line="${__line%"${__line##*[![:space:]]}"}"
+  printf -v "$__var" '%s' "$__line"
+  [[ "$__st" -eq 0 ]] || return 1
+  return 0
+}
+
+on_signal() {
+  if [[ "$1" == INT && "${ASKING:-0}" -eq 1 ]]; then
+    ASK_CANCEL=1
+    return 0
+  fi
+  CAUGHT="$1"
+  cleanup
+}
+trap cleanup EXIT
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+trap 'on_signal HUP' HUP
+
+prepare_live() {
+  local name="$1"
+  mkdir -p "$LIVE/xdg/cache" "$LIVE/xdg/data" "$LIVE/xdg/state" \
+    "$LIVE/home" "$LIVE/tmp" "$LIVE/runtime" "$LIVE/pack"
+  local cwd
+  cwd="$(mktemp -d /tmp/fingeronit-cwd.XXXXXX)"
+  printf '%s\n' "$cwd" > "$LIVE/cwdpath"
+  printf '%s\n' "$name" > "$LIVE/instance"
+  chmod 700 "$LIVE/xdg" "$LIVE/home" "$LIVE/tmp" "$LIVE/runtime" "$LIVE/pack" "$cwd"
+}
+
+pack_config() {
+  local xdg="$1" dest="$2" cfg
+  cfg="$(provider_cfgdir)"
+  [[ -f "$xdg/$cfg/credentials.json" ]] || die "$(provider_title) wrote no credentials. Nothing was sealed."
+  COPYFILE_DISABLE=1 tar -C "$xdg" -czf "$dest" "$cfg"
+  chmod 600 "$dest"
+}
+
+unpack_config() {
+  local archive="$1" xdg="$2" cfg
+  cfg="$(provider_cfgdir)"
+  mkdir -p "$xdg"
+  COPYFILE_DISABLE=1 tar -C "$xdg" -xzf "$archive"
+  chmod 700 "$xdg" "$xdg/$cfg" 2>/dev/null || true
+  [[ -f "$xdg/$cfg/credentials.json" ]] && chmod 600 "$xdg/$cfg/credentials.json"
+}
+
+# The provider's command through the keeper, with this door's ticket. kind is kept for callers.
+run_hey() {
+  local kind="$1"
+  shift
+  [[ -n "$HB_TICKET" ]] || { printf 'fingeronit: no open door to run the provider through\n' >&2; return 1; }
+  local -a flags=(--term "${TERM:-xterm-256color}" --lang "${LANG:-en_US.UTF-8}")
+  [[ "${1:-}" == "tui" ]] && flags+=(--tui)
+  printf '%s\n' "$HB_TICKET" | keeper run "${flags[@]}" -- "$@"
+}
+
+# Sign-in is the one time the provider runs on your side: the browser hands the
+# login back here, and it is sealed straight away.
+run_login() {
+  local kind="login"
+  local cwd home xdg tmp runtime
+  cwd="$(cat "$LIVE/cwdpath")"
+  home="$LIVE/home"
+  xdg="$LIVE/xdg"
+  tmp="$LIVE/tmp"
+  runtime="$LIVE/runtime"
+  local -a args
+  args=("$@")
+  if [[ "${args[0]:-}" == "auth" && "${args[1]:-}" == "status" ]]; then
+    local arg seen=0
+    for arg in "${args[@]}"; do
+      [[ "$arg" == "--json" ]] && seen=1
+    done
+    [[ "$seen" -eq 0 ]] && args+=("--json")
+  fi
+  # The TUI is the point of a session. Other commands stay non-interactive
+  # so a missing login cannot wander into a browser prompt.
+  local noninteractive=1
+  [[ "${args[0]:-}" == "tui" ]] && noninteractive=0
+  (
+    cd "$cwd"
+    if [[ "$kind" == "login" || "$noninteractive" -eq 0 ]]; then
+      env -i \
+        HOME="$home" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+        USER="${USER:-}" LOGNAME="${LOGNAME:-${USER:-}}" \
+        SHELL="/bin/zsh" TERM="${TERM:-xterm-256color}" \
+        LANG="${LANG:-en_US.UTF-8}" TMPDIR="$tmp" \
+        XDG_CONFIG_HOME="$xdg" XDG_CACHE_HOME="$LIVE/xdg/cache" \
+        XDG_DATA_HOME="$LIVE/xdg/data" XDG_STATE_HOME="$LIVE/xdg/state" \
+        XDG_RUNTIME_DIR="$runtime" \
+        HEY_NO_KEYRING=1 HEY_SETUP_AGENT=none \
+        "${PCMD[@]}" "${args[@]}"
+    else
+      env -i \
+        HOME="$home" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+        USER="${USER:-}" LOGNAME="${LOGNAME:-${USER:-}}" \
+        SHELL="/bin/zsh" TERM="${TERM:-xterm-256color}" \
+        LANG="${LANG:-en_US.UTF-8}" TMPDIR="$tmp" \
+        XDG_CONFIG_HOME="$xdg" XDG_CACHE_HOME="$LIVE/xdg/cache" \
+        XDG_DATA_HOME="$LIVE/xdg/data" XDG_STATE_HOME="$LIVE/xdg/state" \
+        XDG_RUNTIME_DIR="$runtime" \
+        HEY_NO_KEYRING=1 HEY_SETUP_AGENT=none HEY_NONINTERACTIVE=1 \
+        "${PCMD[@]}" "${args[@]}"
+    fi
+  )
+}
+
+run_offline() {
+  local scratch cwd
+  scratch="$(mktemp -d /tmp/fingeronit-off.XXXXXX)"
+  cwd="$(mktemp -d /tmp/fingeronit-cwd.XXXXXX)"
+  mkdir -p "$scratch/home" "$scratch/xdg" "$scratch/tmp"
+  local -a args
+  args=("$@")
+  set +e
+  (
+    cd "$cwd"
+    env -i \
+      HOME="$scratch/home" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+      USER="${USER:-}" LOGNAME="${LOGNAME:-${USER:-}}" \
+      TERM="${TERM:-xterm-256color}" LANG="${LANG:-en_US.UTF-8}" \
+      TMPDIR="$scratch/tmp" XDG_CONFIG_HOME="$scratch/xdg" \
+      XDG_CACHE_HOME="$scratch/xdg" XDG_DATA_HOME="$scratch/xdg" \
+      XDG_STATE_HOME="$scratch/xdg" \
+      HEY_NO_KEYRING=1 HEY_SETUP_AGENT=none HEY_NONINTERACTIVE=1 \
+      "${PCMD[@]}" "${args[@]}"
+  )
+  local status=$?
+  set -e
+  shred_path "$scratch"
+  shred_path "$cwd"
+  return "$status"
+}
+
+# finger-touch opens the seal after Touch ID and pipes it into the keeper. An
+# older finger-touch without unseal-stream writes two files here first.
+open_sealed() {
+  local name="$1" reason="$2" dir r c k hash status=0 tstat=""
+  dir="$(instance_dir "$name")"
+  [[ -f "$dir/sealed.box" ]] || { fail "instance $name has no seal. Sign in first." || return $?; }
+  if ! keeper_installed; then
+    [[ -x "$SEAL_LOCAL" ]] || { fail "bin/finger-seal is missing. Run bin/build." || return $?; }
+  fi
+  mkdir -p "$LIVE/pack"
+  chmod 700 "$LIVE/pack"
+  r="$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')"
+  if "$TOUCH" streams > /dev/null 2>&1; then
+    # finger-touch writes the key and login into a pipe that ends in the keeper.
+    # Nothing secret lands in a file on your side. Only the two exit codes and
+    # the keeper's own error text pass through var/live/pack.
+    set +e
+    HB_TICKET="$( { "$TOUCH" unseal-stream "$(account_for "$name")" "$dir/sealed.box" -- "$reason"; printf '%s' "$?" > "$LIVE/pack/t.$r"; } \
+      | keeper open "$name" "$PROVIDER" 2> "$LIVE/pack/e.$r")"
+    status=$?
+    set -e
+    tstat="$(cat "$LIVE/pack/t.$r" 2>/dev/null || printf 1)"
+    # 141 is SIGPIPE: the keeper stopped reading first, so its error is the news.
+    [[ "$tstat" == 141 ]] && tstat=0
+    if [[ "$tstat" != 0 ]]; then
+      rm -f "$LIVE/pack/t.$r" "$LIVE/pack/e.$r"
+      HB_TICKET=""
+      return "$tstat"
+    fi
+    cat "$LIVE/pack/e.$r" >&2 2>/dev/null || true
+    rm -f "$LIVE/pack/t.$r" "$LIVE/pack/e.$r"
+    if [[ "$status" -eq 0 && "$HB_TICKET" =~ ^[0-9a-f]{48}$ ]]; then
+      hash="$(keeper keyhash)" || hash=""
+    fi
+  else
+    # An older finger-touch can only unseal into files. They live here until the
+    # keeper has read them, then they are shredded.
+    c="$LIVE/pack/c.$r"
+    k="$LIVE/pack/k.$r"
+    "$TOUCH" unseal "$(account_for "$name")" "$dir/sealed.box" "$c" "$k" -- "$reason" || status=$?
+    if [[ "$status" -ne 0 ]]; then
+      shred_path "$c"
+      shred_path "$k"
+      return "$status"
+    fi
+    hash="$(shasum -a 256 "$k" | cut -d' ' -f1)"
+    set +e
+    HB_TICKET="$( { od -An -tx1 -v "$k" | tr -d ' \n'; printf '\n'; cat "$c"; } | keeper open "$name" "$PROVIDER")"
+    status=$?
+    set -e
+    shred_path "$c"
+    shred_path "$k"
+  fi
+  if [[ "$status" -ne 0 || ! "$HB_TICKET" =~ ^[0-9a-f]{48}$ || ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+    HB_TICKET=""
+    fail "the keeper did not take the login (see above)" || return $?
+    return 1
+  fi
+  printf '%s\n' "$hash" > "$dir/key.sha256"
+  chmod 600 "$dir/key.sha256"
+}
+
+cmd_help() {
+  cat <<EOF
+fingeronit — a finger on every email action
+
+Your mail provider (HEY or Gmail) signs you in. This box only decides when that
+login is on disk. It opens in your terminal, after Touch ID (or your Mac
+password), and nowhere else. Each instance is one provider.
+
+  fingeronit login [--provider hey|gmail] [name]
+                                   browser sign-in, then seal the credential
+  fingeronit run [name] -- <args>      one command, one fingerprint, then reseal
+  fingeronit session [name]            a shell where hey (or gmail) works until you exit
+  fingeronit status [name]             provider, seal present or not. No mail, no prompt.
+  fingeronit doctor [name]             check each provider's command, its flags, and tools.
+                                   Never unlocks. Run it after HEY or gmail.py changes.
+  fingeronit export [name]             the export questions, without the menu
+  fingeronit export --from A [--from B] [--days N | --all-time] [--md|--pdf|--both]
+  fingeronit export --with A    everything to and from A, with your drafts to A
+                [--to DIR] [--open]
+                                   every thread from A or B, straight through
+  fingeronit --autopilot-test          export every thread from the example sender
+                                   in the past 14 days as md and pdf, then open it
+  fingeronit seal-live                 put a crashed session back in the seal
+  fingeronit destroy [name]            delete that instance and its key
+  fingeronit destroy --all             delete every instance, the key, and the binary
+
+The name defaults to temp.
+With no arguments, fingeronit opens a menu: one screen that shows
+the seal and the door, and says in a sentence where things stand. Arrows or j/k move,
+enter or a number picks, ? is help, r refreshes, q quits. The choices change
+with the state: sign in (HEY or Gmail) when there is no seal; export, browse
+(HEY only), run, or a session when the door is shut. Quit will not leave a
+crashed session open.
+
+Export asks for a sender, days back (default 14), a file type, and a folder,
+then lists subjects. The example address is news@example.com.
+Space ticks, a ticks all, n ticks none, enter writes one markdown or PDF file
+in ~/fingeronit-export, outside this folder, and q cancels. ~/fingeronit-export
+is deleted when fingeronit closes. Before that it
+asks you to move out what you want to keep, even after Ctrl-C.
+
+Inside this folder the bare name fingeronit is enough, after the shell hook in
+~/.zshrc is loaded. source bin/activate still puts bin/fingeronit on PATH from
+anywhere and makes a bare hey refuse. Neither one unlocks anything.
+
+While a command or session is open, the keeper holds the login. Installed
+with sudo bin/install-keeper, the keeper is a separate hidden user and your
+other programs cannot read the login. Without it, the keeper runs as you
+under var/live. Either way hey only runs for this terminal's own fingeronit.
+The menu shuts the door before it draws the next choice. A pipe or a
+captured shell is refused.
+
+  fingeronit clean                     shred scratch an abandoned session left behind
+  fingeronit clean-old                 delete an older HEY CLI login left outside this
+                                   box (~/.config/hey-cli, keychain "hey")
+
+destroy forgets the login on this Mac. A provider's own logout does not revoke
+the grant on its server. Disconnect this Mac at HEY or Google if you want that too.
+EOF
+}
+
+# A self-check that never unlocks. fingeronit leans on HEY's flags and JSON; when
+# HEY changes, this says so before an export quietly finds nothing.
+doctor_line() {
+  local level="$1" msg="$2" mark
+  case "$level" in
+    ok) mark="${C_G:-}ok  ${C_0:-}"; DOC_OK=$((DOC_OK + 1)) ;;
+    warn) mark="${C_Y:-}warn${C_0:-}"; DOC_WARN=$((DOC_WARN + 1)) ;;
+    *) mark="${C_R:-}FAIL${C_0:-}"; DOC_BAD=$((DOC_BAD + 1)) ;;
+  esac
+  printf '  %s  %s\n' "$mark" "$msg"
+}
+
+doctor_flags() {
+  local what="$1" must="$2" nice="$3"
+  shift 3
+  local help flag missing="" soft=""
+  set +e
+  help="$(run_offline "$@" 2>&1)"
+  set -e
+  for flag in $must; do
+    [[ "$help" == *"$flag"* ]] || missing="$missing $flag"
+  done
+  for flag in $nice; do
+    [[ "$help" == *"$flag"* ]] || soft="$soft $flag"
+  done
+  if [[ -n "$missing" ]]; then
+    doctor_line bad "$(provider_cmdname) $what no longer lists:$missing. Exports depend on it."
+  elif [[ -n "$soft" ]]; then
+    doctor_line warn "$(provider_cmdname) $what help does not show:$soft (it may be a global flag)"
+  else
+    doctor_line ok "$(provider_cmdname) $what has$(printf ' %s' $must $nice)"
+  fi
+}
+
+# One provider's checks. A provider that is missing is a problem only when this
+# instance uses it; otherwise it is one line saying that provider is unavailable.
+doctor_provider() {
+  local which="$1" name="$2" mine want got ver
+  provider_load "$name"
+  mine="$PROVIDER"
+  provider_set "$which"
+  if [[ "$which" == hey ]]; then
+    if provider_present; then
+      want="$(awk -F' *= *' '$1 == "binary_sha256" {print $2}' "$ROOT/lockenv.cfg" 2>/dev/null || true)"
+      got="$(shasum -a 256 "$REAL" | cut -d' ' -f1)"
+      if [[ -z "$want" ]]; then
+        doctor_line warn "hey binary has no checksum on record in lockenv.cfg"
+      elif [[ "$got" == "$want" ]]; then
+        doctor_line ok "hey binary matches the checksum it was installed with"
+      else
+        doctor_line bad "hey binary changed since install. Do not unlock until you know why."
+      fi
+      ver="$(run_offline version 2>/dev/null | head -n 1 || true)"
+      [[ -n "$ver" ]] && doctor_line ok "hey says: $ver"
+      doctor_flags "search" "--from --to --date --all" "--json" search --help
+      doctor_flags "thread read" "--markdown" "" thread read --help
+      doctor_flags "attachment list" "" "--json" attachment list --help
+      doctor_flags "attachment save" "--output" "" attachment save --help
+    elif [[ "$mine" == hey ]]; then
+      doctor_line bad "libexec/hey is missing"
+    else
+      doctor_line warn "libexec/hey is missing, so HEY sign-in is unavailable"
+    fi
+  else
+    if provider_present; then
+      doctor_line ok "gmail provider present (lib/providers/gmail.py)"
+      ver="$(run_offline version 2>/dev/null | head -n 1 || true)"
+      [[ -n "$ver" ]] && doctor_line ok "gmail says: $ver"
+      doctor_flags "search" "--from --to --date --all --json" "" search --help
+      doctor_flags "thread read" "--markdown" "" thread read --help
+      doctor_flags "attachment save" "--output" "" attachment save --help
+    elif [[ "$mine" == gmail ]]; then
+      doctor_line bad "lib/providers/gmail.py is missing. This instance cannot be unlocked."
+    else
+      doctor_line warn "lib/providers/gmail.py is missing, so Gmail sign-in is unavailable"
+    fi
+  fi
+  provider_load "$name"
+}
+
+cmd_doctor() {
+  local name="${1:-$DEFAULT_NAME}" want got key ver
+  need_name "$name"
+  DOC_OK=0 DOC_WARN=0 DOC_BAD=0
+  refresh_orphan
+  printf 'fingeronit %s, checking without unlocking anything\n\n' "$FINGERONIT_VERSION"
+  doctor_provider hey "$name"
+  doctor_provider gmail "$name"
+  if [[ -x "$TOUCH" ]]; then
+    key="$("$TOUCH" status "$(account_for "$name")" 2>/dev/null || printf 'unknown')"
+    provider_load "$name"
+    doctor_line ok "finger-touch present. Key for $name ($(provider_title)): $key. Seal: $(seal_state "$name")."
+  else
+    doctor_line bad "bin/finger-touch is missing"
+  fi
+  if command -v python3 > /dev/null 2>&1; then
+    doctor_line ok "$(python3 --version 2>&1)"
+  else
+    doctor_line bad "python3 is missing. Export cannot read the provider's results."
+  fi
+  if command -v cupsfilter > /dev/null 2>&1; then
+    doctor_line ok "cupsfilter present for pdf"
+  else
+    doctor_line warn "cupsfilter missing. Markdown still works, pdf will not."
+  fi
+  doctor_keeper
+  if old_login_found; then
+    doctor_line bad "an older HEY CLI login sits outside this box (~/.config/hey-cli or a keychain item named hey). Run fingeronit clean-old."
+  else
+    doctor_line ok "no older HEY CLI login outside this box"
+  fi
+  if [[ "$(exports_count)" -gt 0 ]]; then
+    doctor_line warn "exports: $(exports_line)"
+  fi
+  if [[ "$(idle_seconds)" -gt 0 ]]; then
+    doctor_line ok "idle timeout: an open door closes after $(idle_label "$(idle_seconds)") with no keys"
+  else
+    doctor_line warn "idle timeout is off (idle_minutes = 0 in lockenv.cfg)"
+  fi
+  case "$(door_state)" in
+    shut|self|mine) doctor_line ok "door: $(door_label)" ;;
+    stale) doctor_line bad "door: a crashed session left the login unsealed. Reseal it." ;;
+    *) doctor_line warn "door: $(door_label)" ;;
+  esac
+  printf '\n%s ok, %s warnings, %s problems.\n' "$DOC_OK" "$DOC_WARN" "$DOC_BAD"
+  [[ "$DOC_BAD" -eq 0 ]]
+}
+
+doctor_keeper() {
+  local want got
+  if keeper_installed; then
+    if keeper selftest > /dev/null 2>&1; then
+      doctor_line ok "keeper: an open login is held by the hidden user _fingeronit"
+    else
+      doctor_line bad "keeper is installed but its self-test fails. Run: sudo bin/install-keeper"
+    fi
+    want="$(shasum -a 256 "$KEEPER_LOCAL" 2>/dev/null | cut -d' ' -f1)"
+    got="$(shasum -a 256 "$KEEPER_SYS" 2>/dev/null | cut -d' ' -f1)"
+    if [[ "$want" != "$got" ]]; then
+      doctor_line warn "the installed keeper differs from lib/keeper. Run: sudo bin/install-keeper"
+    fi
+    want="$(awk -F' *= *' '$1 == "binary_sha256" {print $2}' "$ROOT/lockenv.cfg" 2>/dev/null || true)"
+    got="$(shasum -a 256 "${KEEPER_SYS%/keeper}/hey" 2>/dev/null | cut -d' ' -f1)"
+    if [[ -n "$want" && "$got" != "$want" ]]; then
+      doctor_line bad "the keeper's copy of hey does not match binary_sha256. Run: sudo bin/install-keeper"
+    fi
+    if [[ -f "$GMAIL_PY" ]]; then
+      want="$(shasum -a 256 "$GMAIL_PY" 2>/dev/null | cut -d' ' -f1)"
+      got="$(shasum -a 256 "${KEEPER_SYS%/keeper}/gmail.py" 2>/dev/null | cut -d' ' -f1)"
+      if [[ "$want" != "$got" ]]; then
+        doctor_line warn "the keeper's copy of gmail.py differs from lib/providers/gmail.py. Run: sudo bin/install-keeper"
+      fi
+    fi
+  else
+    doctor_line warn "keeper runs as you, so an open door is readable by your other programs. sudo bin/install-keeper moves it to a separate user."
+    [[ -x "$SEAL_LOCAL" ]] || doctor_line bad "bin/finger-seal is missing. Compile lib/FingerSeal.swift."
+  fi
+}
+
+cmd_status() {
+  local name="${1:-$DEFAULT_NAME}"
+  need_name "$name"
+  provider_load "$name"
+  refresh_orphan
+  local key="absent"
+  if [[ -x "$TOUCH" ]]; then
+    key="$("$TOUCH" status "$(account_for "$name")" 2>/dev/null || printf 'unknown')"
+  fi
+  printf 'instance  %s\n' "$name"
+  printf 'provider  %s\n' "$(provider_title)"
+  printf 'seal      %s\n' "$(seal_state "$name")"
+  printf 'key       %s\n' "$key"
+  printf 'door      %s\n' "$(door_label)"
+  printf 'idle      closes after %s with no keys\n' "$(idle_label "$(idle_seconds)")"
+  printf 'keeper    %s\n' "$(keeper_label)"
+  printf 'exports   %s\n' "$(exports_line)"
+  old_login_found && printf 'old login %s\n' "an older HEY CLI login sits outside this box. fingeronit clean-old removes it."
+  if provider_present; then
+    printf 'binary    present\n'
+  else
+    printf 'binary    missing\n'
+  fi
+}
+
+# A Google "Desktop app" OAuth client file: {"installed": {"client_id": ...}}.
+gmail_client_ok() {
+  [[ -f "$1" && -r "$1" && ! -L "$1" ]] || return 1
+  [[ "$(wc -c < "$1" | tr -d ' ')" -le 65536 ]] || return 1
+  "$PYTHON3" -I -c 'import json, sys
+c = json.load(open(sys.argv[1])).get("installed") or {}
+sys.exit(0 if c.get("client_id") and c.get("client_secret") else 1)' "$1" 2>/dev/null
+}
+
+cmd_login() {
+  local name="" prov="hey" client=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --provider)
+        [[ "$#" -ge 2 ]] || { fail "--provider needs hey or gmail" || return; return; }
+        prov="$2"
+        shift
+        ;;
+      --provider=*) prov="${1#--provider=}" ;;
+      --client)
+        [[ "$#" -ge 2 ]] || { fail "--client needs the Google OAuth client JSON file" || return; return; }
+        client="$2"
+        shift
+        ;;
+      -*) fail "unknown login flag: $1 (try: fingeronit login [--provider hey|gmail] [--client FILE] [name])" || return; return ;;
+      *) [[ -z "$name" ]] || { fail "give one instance name" || return; return; }; name="$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$name" ]] || name="$DEFAULT_NAME"
+  valid_provider "$prov" || { fail "provider must be hey or gmail" || return; return; }
+  require_tty
+  need_name "$name"
+  provider_set "$prov"
+  need_tools
+  local dir
+  dir="$(instance_dir "$name")"
+  [[ ! -f "$dir/sealed.box" ]] || { fail "instance $name already has a seal. Destroy it before signing in again." || return; }
+  audit "$name" login "provider=$prov"
+  acquire "$name" || return
+  prepare_live "$name"
+  local -a login_args=(auth login)
+  if [[ "$prov" == gmail ]]; then
+    if [[ -z "$client" ]]; then
+      printf 'Gmail needs your own Google OAuth client (a Desktop app). docs/gmail.md shows how to make one.\n' > /dev/tty
+      ask client 'Client JSON file you downloaded: ' || { close_door || exit 1; printf 'Nothing was signed in.\n' > /dev/tty; return 0; }
+    fi
+    [[ "$client" == "~" || "$client" == "~/"* ]] && client="$HOME${client#\~}"
+    [[ "$client" == /* ]] || client="$PWD/$client"
+    if ! gmail_client_ok "$client"; then
+      close_door || exit 1
+      fail "that is not a Google Desktop app client file (it needs installed.client_id and client_secret)" || return
+      return
+    fi
+    login_args+=(--client "$client")
+  fi
+  printf 'Signing in to %s in your browser. No agent is connected.\n' "$(provider_title)" >&2
+  set +e
+  run_login "${login_args[@]}"
+  local status=$?
+  set -e
+  if [[ "$status" -ne 0 || ! -f "$LIVE/xdg/$(provider_cfgdir)/credentials.json" ]]; then
+    close_door || exit 1
+    fail "sign-in did not finish. Nothing was sealed." || return
+    return
+  fi
+  mkdir -p "$dir"
+  local archive
+  archive="$(mktemp "$LIVE/pack/login.XXXXXX")"
+  pack_config "$LIVE/xdg" "$archive"
+  set +e
+  "$TOUCH" seal "$(account_for "$name")" "$archive" "$dir/sealed.box" \
+    -- "Seal the new $(provider_title) login into fingeronit $name"
+  status=$?
+  set -e
+  shred_path "$archive"
+  if [[ "$status" -ne 0 ]]; then
+    close_door || exit 1
+    fail "the seal did not stick. Sign-in was not kept." || return
+    return
+  fi
+  printf '%s\n' "$prov" > "$dir/provider"
+  chmod 600 "$dir/provider"
+  close_door || exit 1
+  printf 'Sealed. The door is shut.\n' >&2
+}
+
+cmd_run() {
+  local name="$1"
+  shift
+  require_tty
+  need_name "$name"
+  provider_load "$name"
+  need_tools
+  [[ "$#" -gt 0 ]] || { fail "usage: fingeronit run [name] -- <arguments for $(provider_cmdname)>" || return; }
+  if [[ "$(door_state)" == "mine" ]]; then
+    # Already inside this session: use the open door, no second fingerprint.
+    cmd_inside "$name" "$@" || return
+    printf 'Done. Session %s is still open. exit seals it.\n' "$name" >&2
+    return 0
+  fi
+  if refuse_shape "$@"; then
+    fail "refused. setup, skills, mcp, tokens, and trust-local stay shut." || return
+    return
+  fi
+  audit "$name" run "$@"
+  if ! needs_credential "$@"; then
+    set +e
+    run_offline "$@"
+    local status=$?
+    set -e
+    return "$status"
+  fi
+  acquire "$name" || return
+  set +e
+  open_sealed "$name" "Unlock fingeronit $name to run: $*"
+  local status=$?
+  set -e
+  if [[ "$status" -ne 0 ]]; then
+    close_door || exit 1
+    fail "the door stayed shut" || return
+    return
+  fi
+  set +e
+  run_hey mail "$@"
+  status=$?
+  set -e
+  close_door || exit 1
+  printf 'Done. The door is shut.\n' >&2
+  return "$status"
+}
+
+cmd_session() {
+  local name="${1:-$DEFAULT_NAME}"
+  require_tty
+  need_name "$name"
+  provider_load "$name"
+  need_tools
+  if [[ "$(door_state)" == "mine" ]]; then
+    fail "you are already in session $(lock_instance). $(provider_cmdname) works here. exit seals it." || return
+    return
+  fi
+  audit "$name" session
+  acquire "$name" || return
+  set +e
+  open_sealed "$name" "Open a fingeronit session named $name"
+  local status=$?
+  set -e
+  if [[ "$status" -ne 0 ]]; then
+    close_door || exit 1
+    fail "the door stayed shut" || return
+    return
+  fi
+  local zdot="$LIVE/zdot"
+  mkdir -p "$zdot"
+  cat > "$zdot/.zshenv" <<'EOF'
+unsetopt GLOBAL_RCS
+EOF
+  local where_line cmdname title
+  cmdname="$(provider_cmdname)"
+  title="$(provider_title)"
+  if keeper_installed; then
+    where_line="The login is held by the keeper (user _fingeronit). Your other programs cannot read it."
+  else
+    where_line="The login is held by the keeper under var/live, as you. sudo bin/install-keeper moves it out of reach."
+  fi
+  cat > "$zdot/.zshrc" <<EOF
+PS1='%F{red}fingeronit:${name}%f %~ %# '
+IFS= read -r -u 3 __hb_t 2>/dev/null || __hb_t=""
+exec 3<&-
+function ${cmdname}() {
+  command "$BIN/fingeronit" _inside ${name} -- "\$@" 3< <(print -r -- "\$__hb_t")
+}
+function fingeronit() {
+  command "$BIN/fingeronit" "\$@" 3< <(print -r -- "\$__hb_t")
+}
+printf '%s\n' "Session ${name} is open. ${cmdname} talks to ${title}. fingeronit shows this session's menu."
+printf '%s\n' "$where_line"
+printf '%s\n' "Only this prompt's ${cmdname} and fingeronit can use it. exit seals it."
+printf '%s\n' "It also closes itself after $(idle_label "$(idle_seconds)") with no keys pressed."
+EOF
+  chmod 700 "$zdot"
+  chmod 600 "$zdot/.zshenv" "$zdot/.zshrc"
+  set +e
+  ZDOTDIR="$zdot" /bin/zsh -i 3< <(printf '%s\n' "$HB_TICKET")
+  status=$?
+  set -e
+  close_door || exit 1
+  printf 'Session closed. The door is shut.\n' >&2
+  # The shell's last exit code is not the session's outcome. Sealed is success.
+  return 0
+}
+
+cmd_inside() {
+  local name="$1"
+  shift
+  require_tty
+  need_name "$name"
+  provider_load "$name"
+  [[ -d "$LIVE/lock" ]] || { fail "no session is open" || return; return; }
+  [[ "$(lock_instance)" == "$name" ]] || { fail "the open session is $(lock_instance), not $name" || return; return; }
+  [[ "$(tty)" == "$(lock_tty)" ]] || { fail "refused. This session belongs to another terminal." || return; return; }
+  [[ -n "$HB_TICKET" ]] || { fail "refused. Only the session's own $(provider_cmdname) and fingeronit carry its ticket." || return; return; }
+  if [[ "$#" -eq 0 ]]; then
+    set -- help
+  fi
+  if refuse_shape "$@"; then
+    printf 'fingeronit: refused. setup, skills, mcp, tokens, and trust-local stay shut.\n' >&2
+    return 77
+  fi
+  audit "$name" inside "$@"
+  run_hey mail "$@"
+}
+
+cmd_seal_live() {
+  require_tty
+  need_tools
+  refresh_orphan
+  local name="" st
+  if [[ -d "$LIVE/lock" ]]; then
+    if [[ "$(door_state)" == "mine" ]]; then
+      fail "this session is still running. Type exit at its prompt to seal it." || return
+      return
+    fi
+    if ! lock_is_stale; then
+      fail "pid $(lock_pid) still holds the door. Exit that one; it reseals itself." || return
+      return
+    fi
+    name="$(lock_instance)"
+  elif [[ "$KEEPER_ORPHAN" -eq 1 ]]; then
+    st="$(keeper state 2>/dev/null || true)"
+    name="$(printf '%s' "$st" | awk '{print $2}')"
+  else
+    fail "nothing is sitting open" || return
+    return
+  fi
+  if keeper_is_open; then
+    keeper_reseal "$name" || { fail "reseal failed. The keeper still holds the login." || return; return; }
+  fi
+  CLEAN_LIVE=0
+  clear_live
+  KEEPER_ORPHAN=0
+  printf 'Resealed. The door is shut.\n' >&2
+}
+
+cmd_destroy() {
+  local name="$1"
+  require_tty
+  need_name "$name"
+  local dir
+  dir="$(instance_dir "$name")"
+  [[ -d "$dir" ]] || { fail "no instance named $name" || return; }
+  provider_load "$name"
+  warn_if_left_open || return
+  local word
+  ask word "$(printf 'Destroy instance %s. Type DESTROY: ' "$name")" || true
+  [[ "$word" == "DESTROY" ]] || { fail "left it alone" || return; }
+  audit "$name" destroy
+  if [[ -x "$TOUCH" ]]; then
+    "$TOUCH" drop "$(account_for "$name")" -- "Destroy the seal key for fingeronit $name"
+  fi
+  shred_path "$dir"
+  printf 'Destroyed instance %s. The local login is gone.\n' "$name" >&2
+  printf '%s may still list this sign-in until you disconnect it there.\n' "$(provider_title)" >&2
+}
+
+cmd_destroy_all() {
+  require_tty
+  warn_if_left_open
+  printf 'This deletes every instance and the hey binary.\n' >&2
+  local word
+  ask word 'Type DESTROY: ' || true
+  [[ "$word" == "DESTROY" ]] || { fail "left it alone" || return; }
+  local dir name
+  local -a accounts
+  accounts=()
+  shopt -s nullglob
+  for dir in "$INSTANCES"/*; do
+    [[ -d "$dir" ]] || continue
+    name="$(basename "$dir")"
+    accounts+=("$(account_for "$name")")
+    shred_path "$dir"
+  done
+  shopt -u nullglob
+  if [[ "${#accounts[@]}" -gt 0 && -x "$TOUCH" ]]; then
+    "$TOUCH" drop "${accounts[@]}" -- "Destroy every fingeronit seal key"
+  fi
+  shred_path "$ROOT/libexec/hey"
+  shred_path "$ROOT/bin/finger-touch"
+  printf 'Removed instances, keys, and the hey binary.\n' >&2
+  if keeper_installed; then
+    printf 'The keeper is still installed. Take it out with: sudo %s/bin/install-keeper --remove\n' "$ROOT" >&2
+  fi
+  printf 'Delete the folder when you want the scripts gone too:\n' >&2
+  printf '  rm -rf %q\n' "$ROOT" >&2
+}
+
+export_date_bucket() {
+  local days="$1"
+  [[ "$days" -eq 0 ]] && return 0
+  if [[ "$days" -le 7 ]]; then
+    printf 'last_7_days'
+  elif [[ "$days" -le 30 ]]; then
+    printf 'last_30_days'
+  elif [[ "$days" -le 90 ]]; then
+    printf 'last_90_days'
+  fi
+}
+
+export_bucket_label() {
+  case "$1" in
+    last_7_days) printf 'the last 7 days' ;;
+    last_30_days) printf 'the last 30 days' ;;
+    last_90_days) printf 'the last 90 days' ;;
+    *) printf 'all of your mail' ;;
+  esac
+}
+
+sanitize_sender() {
+  local s
+  s="$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-')"
+  s="$(printf '%s' "$s" | sed 's/-\{2,\}/-/g; s/^-//; s/-$//')"
+  case "$s" in
+    ""|.|..) s="sender" ;;
+  esac
+  printf '%s' "$s"
+}
+
+safe_export_id() {
+  # Gmail attachment ids are long base64url strings: _ and -, up to 1024 long.
+  # (macOS bash regexes cannot count past 255, so the length is checked apart.)
+  [[ "${#1}" -le 1024 && "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]*$ ]]
+}
+
+dest_verdict() {
+  python3 - "$1" "$ROOT" << 'PY'
+import os, sys
+dest, root = sys.argv[1], os.path.realpath(sys.argv[2])
+if not dest.startswith("/"):
+    sys.exit(2)
+path = dest
+missing = []
+while path != "/" and not os.path.exists(path):
+    missing.append(os.path.basename(path))
+    path = os.path.dirname(path)
+real = os.path.realpath(path)
+for part in reversed(missing):
+    if part in ("", ".", ".."):
+        sys.exit(2)
+    real = os.path.normpath(os.path.join(real, part))
+if real == root or real.startswith(root + os.sep):
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+
+unique_export_path() {
+  local path="$1" base ext n
+  if [[ ! -e "$path" ]]; then
+    printf '%s' "$path"
+    return
+  fi
+  base="${path%.*}"
+  ext="${path##*.}"
+  n=2
+  while [[ -e "${base}-${n}.${ext}" ]]; do
+    n=$((n + 1))
+    [[ "$n" -gt 50 ]] && break
+  done
+  printf '%s' "${base}-${n}.${ext}"
+}
+
+# One key, read with dd: bash's read -n turns signal keys back on, and then a
+# Ctrl-C waits for the next key. The x keeps a newline from being stripped.
+read_picker_key() {
+  local b="" extra=""
+  PICK_KEY=""
+  # Blocking on purpose: a polling read would count as a keystroke for the
+  # idle timer. The watchdog hangs up this dd when it needs fingeronit to stop.
+  stty min 1 time 0 < /dev/tty 2>/dev/null || true
+  b="$(dd bs=1 count=1 < /dev/tty 2>/dev/null; printf x)"
+  b="${b%x}"
+  [[ -n "$b" ]] || return 1
+  case "$b" in
+    $'\003'|$'\034')
+      # Ctrl-C or Ctrl-\ with signal keys off: leave the way a signal would.
+      picker_restore
+      printf '\n' > /dev/tty
+      CAUGHT=INT
+      cleanup
+      ;;
+  esac
+  if [[ "$b" == $'\e' ]]; then
+    stty min 0 time 2 < /dev/tty || true
+    extra="$(dd bs=1 count=2 < /dev/tty 2>/dev/null; printf x)"
+    extra="${extra%x}"
+    b="$b$extra"
+  fi
+  PICK_KEY="$b"
+}
+
+export_draw() {
+  local sender="$1" days="$2"
+  local n i start end selected mark box when subj
+  n="${#PICK_IDS[@]}"
+  selected=0
+  i=0
+  while [[ "$i" -lt "$n" ]]; do
+    [[ "${PICK_SEL[$i]}" -eq 1 ]] && selected=$((selected + 1))
+    i=$((i + 1))
+  done
+  start="$PICK_START"
+  if [[ "$PICK_CURSOR" -lt "$start" ]]; then
+    start="$PICK_CURSOR"
+  fi
+  if [[ "$PICK_CURSOR" -ge $((start + 12)) ]]; then
+    start=$((PICK_CURSOR - 11))
+  fi
+  PICK_START="$start"
+  end=$((start + 12))
+  [[ "$end" -gt "$n" ]] && end="$n"
+  printf '\033[H\033[2J' > /dev/tty
+  if [[ "$EXPORT_MODE_CUR" == "all" ]]; then
+    printf 'Export to and from %s\n' "$sender" > /dev/tty
+    printf '%s searched %s for mail from, to and naming them, plus %syour drafts. This list keeps %s.\n' \
+      "$(provider_title)" "$(export_bucket_label "$EXPORT_BUCKET")" "$(provider_has_contacts && printf 'their thread list and ')" "$EXPORT_WINDOW" > /dev/tty
+  else
+  printf 'Export from %s\n' "$sender" > /dev/tty
+  printf '%s searched %s%s. This list keeps %s.\n' \
+    "$(provider_title)" "$(export_bucket_label "$EXPORT_BUCKET")" "$(provider_has_contacts && printf ", plus the sender's thread list")" "$EXPORT_WINDOW" > /dev/tty
+  fi
+  printf '%s in %s. %s selected.\n' "$n" "$EXPORT_WINDOW" "$selected" > /dev/tty
+  if [[ "${PICK_MORE:-0}" -eq 1 ]]; then
+    printf 'Showing the first 200. Narrow the days for the rest.\n' > /dev/tty
+  fi
+  printf '\n' > /dev/tty
+  i="$start"
+  while [[ "$i" -lt "$end" ]]; do
+    if [[ "$i" -eq "$PICK_CURSOR" ]]; then
+      mark='>'
+    else
+      mark=' '
+    fi
+    if [[ "${PICK_SEL[$i]}" -eq 1 ]]; then
+      box='[*]'
+    else
+      box='[ ]'
+    fi
+    when="${PICK_AT[$i]:0:10}"
+    subj="${PICK_SUBJ[$i]:0:70}"
+    printf ' %s %s  %s  %s\n' "$mark" "$box" "$when" "$subj" > /dev/tty
+    i=$((i + 1))
+  done
+  printf '\n%s of %s.  Arrows move. Space ticks. a selects all, n none. Enter exports. q cancels.\n' \
+    $((PICK_CURSOR + 1)) "$n" > /dev/tty
+  if [[ -n "${PICK_NOTE:-}" ]]; then
+    printf '%s\n' "$PICK_NOTE" > /dev/tty
+  fi
+}
+
+# HEY's JSON comes in on stdin and never touches disk. Only the topic id,
+# subject, and date come out. Message summaries stay in this process.
+# Two shapes arrive, one after the other:
+#   search (hey-cli internal/cmd/search.go): .data = [{id, topic_id, subject,
+#     updated_at, messages: [{created_at, creator, ...}]}]
+#   contact threads (contacts_threads.go): .data = {id, email_address,
+#     postings: [{topic_id, name, active_at, created_at, ...}]}
+# Dates are Go RFC3339, up to nine fractional digits, which python 3.9 cannot
+# parse on its own.
+read -r -d '' ROWS_PY << 'PY' || true
+import json, re, sys
+from datetime import datetime, timedelta, timezone
+
+days = int(sys.argv[1])
+cap = int(sys.argv[2]) if len(sys.argv) > 2 else 200
+text = sys.stdin.read()
+dec = json.JSONDecoder()
+blobs, i, n = [], 0, len(text)
+while i < n:
+    while i < n and text[i].isspace():
+        i += 1
+    if i >= n:
+        break
+    try:
+        obj, i = dec.raw_decode(text, i)
+    except ValueError:
+        break
+    blobs.append(obj)
+
+found = []
+def collect(obj):
+    if isinstance(obj, list):
+        for item in obj:
+            collect(item)
+    elif isinstance(obj, dict):
+        if "topic_id" in obj:
+            found.append(obj)
+        else:
+            for key in ("data", "results", "matches", "postings"):
+                if key in obj:
+                    collect(obj[key])
+for blob in blobs:
+    collect(blob)
+
+STAMP = re.compile(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2})?)(?:\.(\d+))?\s*(Z|[+-]\d{2}:?\d{2})?$")
+def parse(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value / 1000 if value > 1e11 else value, timezone.utc)
+    if not isinstance(value, str):
+        return None
+    m = STAMP.match(value.strip())
+    if not m:
+        return None
+    clock = m.group(2) if m.group(2).count(":") == 2 else m.group(2) + ":00"
+    frac = (m.group(3) or "0")[:6].ljust(6, "0")
+    tz = m.group(4) or "+00:00"
+    if tz == "Z":
+        tz = "+00:00"
+    elif ":" not in tz:
+        tz = tz[:3] + ":" + tz[3:]
+    try:
+        return datetime.fromisoformat("%sT%s.%s%s" % (m.group(1), clock, frac, tz))
+    except ValueError:
+        return None
+
+def when(row):
+    best = None
+    for msg in row.get("messages") or []:
+        if isinstance(msg, dict):
+            s = parse(msg.get("created_at"))
+            if s and (best is None or s > best):
+                best = s
+    if best is None:
+        # A search row has messages; a contact's posting has active_at, the
+        # time of its latest message.
+        keys = ("updated_at", "created_at", "active_at")
+        if "messages" not in row:
+            keys = ("active_at", "updated_at", "created_at")
+        for key in keys:
+            best = parse(row.get(key))
+            if best:
+                break
+    return best
+
+cutoff = datetime.now(timezone.utc) - timedelta(days=days) if days > 0 else None
+rows, seen = [], set()
+total = nodate = old = 0
+for row in found:
+    tid = row.get("topic_id")
+    if tid in (None, ""):
+        continue
+    tid = str(tid)
+    if tid in seen:
+        continue
+    seen.add(tid)
+    total += 1
+    stamp = when(row)
+    if stamp is None:
+        nodate += 1
+        continue
+    if cutoff is not None and stamp < cutoff:
+        old += 1
+        continue
+    subject = str(row.get("subject") or row.get("name") or "(no subject)")
+    rows.append((stamp, tid, subject))
+rows.sort(key=lambda item: item[0], reverse=True)
+more = len(rows) > cap
+rows = rows[:cap]
+def clean(value):
+    return "".join(" " if ch in "\t\r\n" else ch for ch in value)
+sys.stdout.write("STAT\t%d\t%d\t%d\n" % (total, nodate, old))
+sys.stdout.write("MORE\t%d\n" % (1 if more else 0))
+for stamp, tid, subject in rows:
+    at = stamp.astimezone().strftime("%Y-%m-%d %H:%M")
+    sys.stdout.write("ROW\t%s\t%s\t%s\n" % (clean(tid), clean(subject), at))
+PY
+
+# Contact ids for a sender, from HEY JSON on stdin: the creators of search
+# matches, or rows of `hey contact list`. argv[1] is an address or a name.
+read -r -d '' CONTACT_PY << 'PY' || true
+import json, sys
+want = sys.argv[1].strip().lower()
+text = sys.stdin.read()
+dec = json.JSONDecoder()
+blobs, i, n = [], 0, len(text)
+while i < n:
+    while i < n and text[i].isspace():
+        i += 1
+    if i >= n:
+        break
+    try:
+        obj, i = dec.raw_decode(text, i)
+    except ValueError:
+        break
+    blobs.append(obj)
+ids = []
+def take(c):
+    if not isinstance(c, dict) or not c.get("id"):
+        return
+    mail = str(c.get("email_address") or "").strip().lower()
+    name = str(c.get("name") or "").strip().lower()
+    if (mail and mail == want) or ("@" not in want and name and name == want):
+        cid = str(c["id"])
+        if cid.isdigit() and cid not in ids:
+            ids.append(cid)
+def walk(obj):
+    if isinstance(obj, list):
+        for item in obj:
+            walk(item)
+    elif isinstance(obj, dict):
+        if "messages" in obj:
+            for msg in obj.get("messages") or []:
+                if isinstance(msg, dict):
+                    take(msg.get("creator"))
+        elif "email_address" in obj and "id" in obj and "topic_id" not in obj:
+            take(obj)
+        if "data" in obj:
+            walk(obj["data"])
+for blob in blobs:
+    walk(blob)
+sys.stdout.write("".join(cid + "\n" for cid in ids[:5]))
+PY
+
+# Drafts addressed to any of argv[1:], from `hey draft list --all --json` on
+# stdin, printed as rows ROWS_PY reads: topic_id "d:<draft id>". Only the id,
+# subject and date travel; the draft's summary stays in this process.
+read -r -d '' DRAFTS_PY << 'PY' || true
+import json, re, sys
+want = {a.strip().lower() for a in sys.argv[1:] if a.strip()}
+try:
+    obj = json.loads(sys.stdin.read())
+except ValueError:
+    sys.exit(0)
+if isinstance(obj, dict):
+    obj = obj.get("data", [])
+rows = []
+for d in obj if isinstance(obj, list) else []:
+    if not isinstance(d, dict) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(d.get("id") or "")):
+        continue
+    people = d.get("addressed_contacts") or []
+    hit = False
+    for c in people:
+        if not isinstance(c, dict):
+            continue
+        mail = str(c.get("email_address") or "").strip().lower()
+        name = str(c.get("name") or "").strip().lower()
+        if mail in want or name in want:
+            hit = True
+    if not hit:
+        continue
+    subject = str(d.get("subject") or "(no subject)")
+    rows.append({"topic_id": "d:%s" % d["id"], "subject": "[draft] " + subject,
+                 "updated_at": d.get("updated_at")})
+json.dump({"data": rows}, sys.stdout)
+sys.stdout.write("\n")
+PY
+
+# One draft from `hey draft show <id> --json` on stdin, as markdown.
+read -r -d '' DRAFT_MD_PY << 'PY' || true
+import json, sys
+try:
+    obj = json.loads(sys.stdin.read())
+except ValueError:
+    sys.exit(1)
+if isinstance(obj, dict) and isinstance(obj.get("data"), dict):
+    obj = obj["data"]
+if not isinstance(obj, dict):
+    sys.exit(1)
+out = ["Draft, not sent."]
+for label, key in (("From", "from"), ("To", "to"), ("Cc", "cc"), ("Bcc", "bcc")):
+    value = obj.get(key)
+    if isinstance(value, list):
+        value = ", ".join(str(v) for v in value)
+    if value:
+        out.append("%s: %s" % (label, value))
+if obj.get("scheduled_delivery_at"):
+    out.append("Scheduled: %s" % obj["scheduled_delivery_at"])
+out.append("")
+out.append(str(obj.get("body") or ""))
+sys.stdout.write("\n".join(out) + "\n")
+PY
+
+# Attachment ids from `hey attachment list <topic> --json` on stdin.
+read -r -d '' ATTS_PY << 'PY' || true
+import json, sys
+text = sys.stdin.read()
+try:
+    obj = json.loads(text)
+except ValueError:
+    sys.exit(0)
+if isinstance(obj, dict):
+    obj = obj.get("data", [])
+for row in obj if isinstance(obj, list) else []:
+    if isinstance(row, dict) and row.get("id"):
+        sys.stdout.write(str(row["id"]) + "\n")
+PY
+
+# Search HEY and fill PICK_*. Sets EXPORT_STAT for an empty result.
+export_load_rows() {
+  local bucket="$1" days="$2" cap="$3" rows
+  shift 3
+  rows="$LIVE/tmp/rows.tsv"
+  PICK_IDS=()
+  PICK_SUBJ=()
+  PICK_AT=()
+  PICK_SEL=()
+  PICK_MORE=0
+  EXPORT_STAT=""
+  local -a st
+  set +e
+  # HEY's search only finds threads its index matches, which can be a few
+  # of them. The sender's contact page lists every thread they are on, so
+  # fingeronit reads that too. Both stay in memory; ROWS_PY drops duplicates and
+  # applies the days window. Gmail has no contact thread lists: search only.
+  (
+    rc=0
+    for one in "$@"; do
+      found="" ids="" cid=""
+      if [[ -n "$bucket" ]]; then
+        found="$(run_hey mail search --from "$one" --date "$bucket" --all --json)" || rc=$?
+      else
+        found="$(run_hey mail search --from "$one" --all --json)" || rc=$?
+      fi
+      printf '%s\n' "$found"
+      if provider_has_contacts; then
+        ids="$(printf '%s' "$found" | python3 -I -c "$CONTACT_PY" "$one")" || ids=""
+        if [[ -z "$ids" && "$one" == *@* ]]; then
+          ids="$(run_hey mail contact list --all --json 2>/dev/null | python3 -I -c "$CONTACT_PY" "$one")" || ids=""
+        fi
+      fi
+      while IFS= read -r cid; do
+        [[ "$cid" =~ ^[0-9]+$ ]] || continue
+        run_hey mail contact threads "$cid" --all --json \
+          || printf 'fingeronit: %s did not give the thread list for %s. Showing search matches only.\n' "$(provider_title)" "$one" >&2
+      done <<< "$ids"
+      if [[ "$EXPORT_MODE_CUR" == "all" ]]; then
+        # Mail you sent them, then anything that names the address at all.
+        if [[ -n "$bucket" ]]; then
+          run_hey mail search --to "$one" --date "$bucket" --all --json || rc=$?
+          run_hey mail search "$one" --date "$bucket" --all --json || rc=$?
+        else
+          run_hey mail search --to "$one" --all --json || rc=$?
+          run_hey mail search "$one" --all --json || rc=$?
+        fi
+      fi
+    done
+    if [[ "$EXPORT_MODE_CUR" == "all" ]]; then
+      run_hey mail draft list --all --json | python3 -I -c "$DRAFTS_PY" "$@" \
+        || printf 'fingeronit: %s did not give your drafts. The rest is complete.\n' "$(provider_title)" >&2
+    fi
+    exit "$rc"
+  ) | python3 -I -c "$ROWS_PY" "$days" "$cap" > "$rows"
+  st=("${PIPESTATUS[@]}")
+  set -e
+  chmod 600 "$rows" 2>/dev/null || true
+  if [[ "${st[0]}" -ne 0 ]]; then
+    shred_path "$rows"
+    return 2
+  fi
+  if [[ "${st[1]}" -ne 0 ]]; then
+    shred_path "$rows"
+    return 1
+  fi
+  local kind a b c
+  while IFS=$'\t' read -r kind a b c; do
+    case "$kind" in
+      STAT) EXPORT_STAT="$a $b $c" ;;
+      MORE) PICK_MORE="$a" ;;
+      ROW)
+        PICK_IDS+=("$a")
+        PICK_SUBJ+=("$b")
+        PICK_AT+=("$c")
+        PICK_SEL+=(0)
+        ;;
+    esac
+  done < "$rows"
+  shred_path "$rows"
+}
+
+export_picker() {
+  local sender="$1" days="$2"
+  local n chosen any i
+  n="${#PICK_IDS[@]}"
+  PICK_CURSOR=0
+  PICK_START=0
+  PICK_NOTE=""
+  PICK_KEY=""
+  chosen=0
+  PICKER_STTY="$(stty -g < /dev/tty)"
+  if ! stty -echo -icanon -isig min 1 time 0 < /dev/tty; then
+    picker_restore
+    fail "could not take the keyboard for the subject list" || return $?
+    return 1
+  fi
+  while true; do
+    export_draw "$sender" "$days"
+    PICK_NOTE=""
+    if ! read_picker_key; then
+      chosen=0
+      break
+    fi
+    case "$PICK_KEY" in
+      $'\e[A'|$'\eOA')
+        [[ "$PICK_CURSOR" -gt 0 ]] && PICK_CURSOR=$((PICK_CURSOR - 1))
+        ;;
+      $'\e[B'|$'\eOB')
+        [[ "$PICK_CURSOR" -lt $((n - 1)) ]] && PICK_CURSOR=$((PICK_CURSOR + 1))
+        ;;
+      ' ')
+        if [[ "${PICK_SEL[$PICK_CURSOR]}" -eq 1 ]]; then
+          PICK_SEL[$PICK_CURSOR]=0
+        else
+          PICK_SEL[$PICK_CURSOR]=1
+        fi
+        ;;
+      a|A)
+        i=0
+        while [[ "$i" -lt "$n" ]]; do
+          PICK_SEL[$i]=1
+          i=$((i + 1))
+        done
+        ;;
+      n|N)
+        i=0
+        while [[ "$i" -lt "$n" ]]; do
+          PICK_SEL[$i]=0
+          i=$((i + 1))
+        done
+        ;;
+      k)
+        [[ "$PICK_CURSOR" -gt 0 ]] && PICK_CURSOR=$((PICK_CURSOR - 1))
+        ;;
+      j)
+        [[ "$PICK_CURSOR" -lt $((n - 1)) ]] && PICK_CURSOR=$((PICK_CURSOR + 1))
+        ;;
+      q|Q|$'\e')
+        chosen=0
+        break
+        ;;
+      $'\n'|$'\r')
+        any=0
+        i=0
+        while [[ "$i" -lt "$n" ]]; do
+          [[ "${PICK_SEL[$i]}" -eq 1 ]] && any=1
+          i=$((i + 1))
+        done
+        if [[ "$any" -eq 0 ]]; then
+          PICK_NOTE="Nothing selected."
+        else
+          chosen=1
+          break
+        fi
+        ;;
+    esac
+  done
+  picker_restore
+  printf '\033[H\033[2J' > /dev/tty
+  [[ "$chosen" -eq 1 ]]
+}
+
+export_one_thread() {
+  local id="$1" subj="$2" at="$3" outmd="$4" dest="$5"
+  local part adir aid names status f base
+  part="$LIVE/tmp/part.md"
+  set +e
+  run_hey mail thread read "$id" --markdown > "$part"
+  status=$?
+  set -e
+  {
+    printf '## %s\n\n' "$subj"
+    printf 'At: %s\n\n' "$at"
+    if [[ "$status" -eq 0 && -f "$part" ]]; then
+      cat "$part"
+    else
+      printf 'Could not read this thread.\n'
+      EXPORT_READ_FAIL=$((EXPORT_READ_FAIL + 1))
+    fi
+    printf '\n'
+  } >> "$outmd"
+  shred_path "$part"
+  adir="$dest/attachments/$id"
+  mkdir -p "$adir"
+  chmod 700 "$dest/attachments" "$adir"
+  set +e
+  run_hey mail attachment list "$id" --json | python3 -I -c "$ATTS_PY" > "$LIVE/tmp/atts.txt"
+  status="${PIPESTATUS[0]}"
+  set -e
+  if [[ "$status" -eq 0 && -f "$LIVE/tmp/atts.txt" ]]; then
+    local stage="$adir/.fingeronit-stage" target fbase fext k
+    while IFS= read -r aid; do
+      [[ -n "$aid" ]] || continue
+      safe_export_id "$aid" || continue
+      rm -rf "$stage"
+      mkdir -p "$stage"
+      chmod 700 "$stage"
+      if ! printf '%s\n' "$HB_TICKET" | keeper save "$aid" 2> "$LIVE/tmp/save.err" \
+        | tar -xf - -C "$stage" 2> /dev/null; then
+        EXPORT_ATT_FAIL=$((EXPORT_ATT_FAIL + 1))
+        continue
+      fi
+      while IFS= read -r -d '' f; do
+        base="$(basename "$f")"
+        target="$adir/$base"
+        if [[ -e "$target" ]]; then
+          if cmp -s "$f" "$target"; then
+            rm -f "$f"
+            EXPORT_ATT_SAME=$((EXPORT_ATT_SAME + 1))
+            continue
+          fi
+          fbase="${base%.*}"
+          fext=""
+          [[ "$base" == *.* && -n "$fbase" ]] && fext=".${base##*.}"
+          [[ -n "$fext" ]] || fbase="$base"
+          k=2
+          while [[ -e "$adir/$fbase ($k)$fext" ]]; do k=$((k + 1)); done
+          target="$adir/$fbase ($k)$fext"
+        fi
+        mv "$f" "$target"
+        EXPORT_ATT_SAVED=$((EXPORT_ATT_SAVED + 1))
+      done < <(find "$stage" -type f -print0)
+    done < "$LIVE/tmp/atts.txt"
+    rm -rf "$stage"
+  fi
+  shred_path "$LIVE/tmp/atts.txt"
+  shred_path "$LIVE/tmp/save.err"
+  names=""
+  if [[ -d "$adir" ]]; then
+    while IFS= read -r -d '' f; do
+      base="$(basename "$f")"
+      names="${names}${base}"$'\n'
+    done < <(find "$adir" -type f ! -path '*/.fingeronit-stage/*' -print0)
+  fi
+  if [[ -n "$names" ]]; then
+    printf '\nAttachments:\n%s\n' "$names" >> "$outmd"
+  else
+    shred_path "$adir"
+  fi
+}
+
+export_one_draft() {
+  local id="$1" subj="$2" at="$3" outmd="$4" part status
+  part="$LIVE/tmp/part.md"
+  set +e
+  run_hey mail draft show "$id" --json | python3 -I -c "$DRAFT_MD_PY" > "$part"
+  status=$?
+  [[ "${PIPESTATUS[0]}" -eq 0 ]] || status=1
+  set -e
+  {
+    printf '## %s\n\n' "$subj"
+    printf 'At: %s\n\n' "$at"
+    if [[ "$status" -eq 0 && -s "$part" ]]; then
+      cat "$part"
+    else
+      printf 'Could not read this draft.\n'
+      EXPORT_READ_FAIL=$((EXPORT_READ_FAIL + 1))
+    fi
+    printf '\n'
+  } >> "$outmd"
+  shred_path "$part"
+}
+
+export_write_pdf() {
+  local src="$1" pdf="$2" txt status
+  txt="$LIVE/tmp/export.txt"
+  cp "$src" "$txt"
+  chmod 600 "$txt"
+  set +e
+  cupsfilter "$txt" > "$pdf" 2>"$LIVE/tmp/cups.err"
+  status=$?
+  set -e
+  shred_path "$txt"
+  shred_path "$LIVE/tmp/cups.err"
+  if [[ "$status" -ne 0 || ! -s "$pdf" ]]; then
+    rm -f "$pdf"
+    return 1
+  fi
+  chmod 600 "$pdf"
+}
+
+cmd_export() {
+  local name="$1"
+  local sender="" days="" kind="" dest="" default="" bucket="" stem="" one=""
+  local -a senders=()
+  local hits="" status="" n=0 i=0 count=0
+  local outmd="" outpdf="" final_md="" final_pdf="" pdf_ok=0
+  local id subj at
+  require_tty
+  need_name "$name"
+  provider_load "$name"
+  need_tools
+  [[ "$(seal_state "$name")" == "yes" ]] || { fail "instance $name has no seal. Sign in first." || return; }
+  local inside=0 shut_msg="The door is shut."
+  if [[ "$(door_state)" == "mine" ]]; then
+    [[ "$(lock_instance)" == "$name" ]] || { fail "the open session is $(lock_instance), not $name" || return; return; }
+    [[ -n "$HB_TICKET" ]] || { fail "refused. Only the session's own fingeronit carries its ticket." || return; return; }
+    inside=1
+    shut_msg="Session $name is still open. exit seals it."
+  else
+    warn_if_left_open || return
+  fi
+  if [[ "$EXPORT_AUTO" -eq 1 ]]; then
+    senders=("${EXPORT_SENDERS[@]+"${EXPORT_SENDERS[@]}"}")
+    [[ "${#senders[@]}" -gt 0 ]] || senders=("$EXAMPLE_SENDER")
+    days="${EXPORT_DAYS:-14}"
+    kind="${EXPORT_KIND:-both}"
+    dest="$EXPORT_DEST"
+  else
+    printf 'Mail with one or more addresses, into one file. Five questions, then you tick threads.\n' > /dev/tty
+    printf '%sEnter takes the [default]. Enter on an empty sender goes back.%s\n\n' "${C_D:-}" "${C_0:-}" > /dev/tty
+    local q1="1/5 Address (example: news@example.com): "
+    [[ -n "${LAST_SENDER:-}" ]] && q1="$(printf '1/5 Address [%s]: ' "$LAST_SENDER")"
+    ask sender "$q1" || { printf 'Nothing exported.\n' > /dev/tty; return 0; }
+    [[ -n "$sender" ]] || sender="${LAST_SENDER:-}"
+    [[ -n "$sender" ]] || { printf 'Nothing exported.\n' > /dev/tty; return 0; }
+    LAST_SENDER="$sender"
+    read -r -a senders <<< "${sender//,/ }"
+    ask EXPORT_MODE '2/5 Which mail [1 from them, 2 to and from, with drafts] [1]: ' || { printf 'Nothing exported.\n' > /dev/tty; return 0; }
+    case "$EXPORT_MODE" in
+      ""|1) EXPORT_MODE=from ;;
+      2) EXPORT_MODE=all ;;
+      *) fail "no such mail choice" || return; return ;;
+    esac
+    ask days '3/5 Days back, 0 for all time [14]: ' || { printf 'Nothing exported.\n' > /dev/tty; return 0; }
+    [[ -n "$days" ]] || days=14
+    [[ "$days" =~ ^[0-9]+$ ]] || { fail "need a number of days" || return; return; }
+    days=$((10#$days))
+    [[ "$days" -le 3650 ]] || { fail "days must be 0 (all time) up to 3650" || return; return; }
+    ask kind '4/5 File [1 markdown, 2 pdf, 3 both]: ' || { printf 'Nothing exported.\n' > /dev/tty; return 0; }
+    case "$kind" in
+      ""|1) kind="md" ;;
+      2) kind="pdf" ;;
+      3) kind="both" ;;
+      *) fail "no such file choice" || return; return ;;
+    esac
+    one="${senders[*]}"
+    default="$EXPORT_HOME/$(sanitize_sender "${one// /+}")"
+    ask dest "$(printf '5/5 Folder [%s]: ' "$default")" || { printf 'Nothing exported.\n' > /dev/tty; return 0; }
+    [[ -n "$dest" ]] || dest="$default"
+  fi
+  [[ "${#senders[@]}" -gt 0 && "${#senders[@]}" -le 10 ]] || { fail "give one to ten senders" || return; return; }
+  for one in "${senders[@]}"; do
+    [[ -n "$one" && ${#one} -le 200 && "$one" != -* && "$one" != *$'\t'* ]] || {
+      fail "that sender is not usable: $one" || return
+      return
+    }
+  done
+  [[ "$days" =~ ^[0-9]+$ && "$days" -le 3650 ]] || { fail "days must be 0 (all time) up to 3650" || return; return; }
+  days=$((10#$days))
+  case "$kind" in md|pdf|both) ;; *) fail "file must be md, pdf, or both" || return; return ;; esac
+  sender="${senders[*]}"
+  sender="${sender// / or }"
+  EXPORT_MODE_CUR="${EXPORT_MODE:-from}"
+  [[ "$EXPORT_MODE_CUR" == "all" ]] || EXPORT_MODE_CUR=from
+  local mode_word="from"
+  [[ "$EXPORT_MODE_CUR" == "all" ]] && mode_word="to and from"
+  if [[ "$days" -eq 0 ]]; then
+    EXPORT_WINDOW="all time"
+    stem="all-time"
+  else
+    EXPORT_WINDOW="the past $days days"
+    stem="past-${days}-days"
+  fi
+  [[ "$EXPORT_MODE_CUR" == "all" ]] && stem="to-and-from-$stem"
+  if [[ -z "$dest" ]]; then
+    one="${senders[*]}"
+    dest="$EXPORT_HOME/$(sanitize_sender "${one// /+}")"
+  fi
+  if [[ "$EXPORT_AUTO" -eq 1 ]]; then
+    printf 'Every thread %s %s in %s,\n' "$mode_word" "$sender" "$EXPORT_WINDOW" > /dev/tty
+    local kind_label="markdown and pdf"
+    [[ "$kind" == "md" ]] && kind_label="markdown"
+    [[ "$kind" == "pdf" ]] && kind_label="pdf"
+    printf 'as %s in %s. One fingerprint.\n\n' "$kind_label" "$dest" > /dev/tty
+  fi
+  if [[ "$dest" == "~" || "$dest" == "~/"* ]]; then
+    dest="$HOME${dest#\~}"
+  fi
+  if [[ "$dest" != /* ]]; then
+    dest="$HOME/$dest"
+  fi
+  set +e
+  dest_verdict "$dest"
+  status=$?
+  set -e
+  if [[ "$status" -eq 1 ]]; then
+    fail "that folder is inside this fingeronit folder. Pick somewhere else." || return
+    return
+  fi
+  if [[ "$status" -ne 0 ]]; then
+    fail "that folder needs to be a full path" || return
+    return
+  fi
+  mkdir -p "$dest" || { fail "could not create that folder" || return; return; }
+  set +e
+  dest_verdict "$dest"
+  status=$?
+  set -e
+  if [[ "$status" -ne 0 ]]; then
+    fail "that folder is inside this fingeronit folder. Pick somewhere else." || return
+    return
+  fi
+  bucket="$(export_date_bucket "$days")"
+  EXPORT_BUCKET="$bucket"
+  if [[ "$inside" -eq 0 ]]; then
+    acquire "$name" || return
+    set +e
+    open_sealed "$name" "Unlock fingeronit $name to list subjects and export"
+    status=$?
+    set -e
+    if [[ "$status" -ne 0 ]]; then
+      close_door || exit 1
+      fail "the door stayed shut" || return
+      return
+    fi
+  fi
+  mkdir -p "$LIVE/tmp"
+  chmod 700 "$LIVE/tmp"
+  beat
+  printf 'Asking %s for mail %s %s...\n' "$(provider_title)" "$mode_word" "$sender" > /dev/tty
+  set +e
+  local cap=200
+  [[ "$EXPORT_AUTO" -eq 1 ]] && cap=5000
+  export_load_rows "$bucket" "$days" "$cap" "${senders[@]}"
+  status=$?
+  set -e
+  if [[ "$status" -eq 2 ]]; then
+    close_door || exit 1
+    fail "$(provider_title)'s search did not finish. Its own message, if any, is above." || return
+    return
+  fi
+  if [[ "$status" -ne 0 ]]; then
+    close_door || exit 1
+    fail "could not read $(provider_title)'s search results" || return
+    return
+  fi
+  n="${#PICK_IDS[@]}"
+  if [[ "$n" -eq 0 ]]; then
+    local total=0 nodate=0 old=0
+    read -r total nodate old <<< "${EXPORT_STAT:-0 0 0}"
+    close_door || exit 1
+    if [[ "$total" -eq 0 ]]; then
+      printf '%s found no threads %s %s in %s.\n' "$(provider_title)" "$mode_word" "$sender" "$(export_bucket_label "$bucket")" > /dev/tty
+      printf 'Check the address against the contact page in %s.\n' "$(provider_title)" > /dev/tty
+    else
+      printf '%s found %s threads %s %s, none in %s.\n' "$(provider_title)" "$total" "$mode_word" "$sender" "$EXPORT_WINDOW" > /dev/tty
+      printf '%s were older. %s had no date fingeronit could read.\n' "$old" "$nodate" > /dev/tty
+      [[ "$nodate" -gt 0 ]] && printf 'That second number is a fingeronit bug. The counts above are safe to share.\n' > /dev/tty
+    fi
+    printf '%s\n' "$shut_msg" > /dev/tty
+    [[ "$EXPORT_AUTO" -eq 1 ]] && return 1
+    return 0
+  fi
+  if [[ "$EXPORT_AUTO" -eq 1 ]]; then
+    printf 'Found %s:\n' "$n" > /dev/tty
+    i=0
+    while [[ "$i" -lt "$n" ]]; do
+      PICK_SEL[$i]=1
+      printf '  %s  %s\n' "${PICK_AT[$i]:0:10}" "${PICK_SUBJ[$i]:0:70}" > /dev/tty
+      i=$((i + 1))
+    done
+    status=0
+  else
+    set +e
+    export_picker "$sender" "$days"
+    status=$?
+    set -e
+    picker_restore
+  fi
+  if [[ "$status" -ne 0 ]]; then
+    close_door || exit 1
+    printf 'Nothing exported. %s\n' "$shut_msg" > /dev/tty
+    return 0
+  fi
+  count=0
+  i=0
+  while [[ "$i" -lt "$n" ]]; do
+    [[ "${PICK_SEL[$i]}" -eq 1 ]] && count=$((count + 1))
+    i=$((i + 1))
+  done
+  if [[ "$kind" == "pdf" ]]; then
+    outmd="$LIVE/tmp/combined.md"
+  else
+    outmd="$(unique_export_path "$dest/${stem}.md")"
+  fi
+  final_pdf=""
+  if [[ "$kind" == "pdf" || "$kind" == "both" ]]; then
+    final_pdf="$(unique_export_path "$dest/${stem}.pdf")"
+  fi
+  {
+    printf '# Mail %s %s\n\n' "$mode_word" "$sender"
+    if [[ "$days" -eq 0 ]]; then
+      printf 'All time. %s threads.\n\n' "$count"
+    else
+      printf 'Past %s days. %s threads.\n\n' "$days" "$count"
+    fi
+  } > "$outmd"
+  chmod 600 "$outmd"
+  printf 'Writing %s %s...\n' "$count" "$([[ "$count" -eq 1 ]] && printf thread || printf threads)" > /dev/tty
+  EXPORT_READ_FAIL=0 EXPORT_ATT_SAVED=0 EXPORT_ATT_SAME=0 EXPORT_ATT_FAIL=0
+  local done_n=0
+  i=0
+  while [[ "$i" -lt "$n" ]]; do
+    if [[ "${PICK_SEL[$i]}" -eq 1 ]]; then
+      done_n=$((done_n + 1))
+      beat
+      printf '\r  %s of %s' "$done_n" "$count" > /dev/tty
+      id="${PICK_IDS[$i]}"
+      subj="${PICK_SUBJ[$i]}"
+      at="${PICK_AT[$i]}"
+      if [[ "$id" =~ ^d:[A-Za-z0-9_-]{1,128}$ ]]; then
+        export_one_draft "${id#d:}" "$subj" "$at" "$outmd"
+      elif safe_export_id "$id"; then
+        export_one_thread "$id" "$subj" "$at" "$outmd" "$dest"
+      else
+        printf '## %s\n\nSkipped. The thread id was not usable.\n\n' "$subj" >> "$outmd"
+      fi
+    fi
+    i=$((i + 1))
+  done
+  printf '\n' > /dev/tty
+  pdf_ok=0
+  if [[ -n "$final_pdf" ]]; then
+    if export_write_pdf "$outmd" "$final_pdf"; then
+      pdf_ok=1
+    fi
+  fi
+  final_md=""
+  if [[ "$kind" == "pdf" ]]; then
+    if [[ "$pdf_ok" -ne 1 ]]; then
+      final_md="$(unique_export_path "$dest/${stem}.md")"
+      cp "$outmd" "$final_md"
+      chmod 600 "$final_md"
+    fi
+    shred_path "$outmd"
+  else
+    final_md="$outmd"
+  fi
+  audit "$name" export "$sender" "mode=$EXPORT_MODE_CUR" "days=$days" "count=$count" "file=$kind"
+  close_door || exit 1
+  if [[ "$count" -eq 1 ]]; then
+    printf 'Exported 1 thread.\n' > /dev/tty
+  else
+    printf 'Exported %s threads.\n' "$count" > /dev/tty
+  fi
+  if [[ "$EXPORT_READ_FAIL" -gt 0 ]]; then
+    printf '%s%s could not be read. The file marks each one "Could not read this thread."%s\n' \
+      "$C_Y" "$([[ "$EXPORT_READ_FAIL" -eq 1 ]] && printf '1 thread' || printf '%s threads' "$EXPORT_READ_FAIL")" "$C_0" > /dev/tty
+  fi
+  if [[ $((EXPORT_ATT_SAVED + EXPORT_ATT_SAME + EXPORT_ATT_FAIL)) -gt 0 ]]; then
+    printf 'Attachments: %s saved' "$EXPORT_ATT_SAVED" > /dev/tty
+    [[ "$EXPORT_ATT_SAME" -gt 0 ]] && printf ', %s identical repeats skipped' "$EXPORT_ATT_SAME" > /dev/tty
+    [[ "$EXPORT_ATT_FAIL" -gt 0 ]] && printf ', %s%s failed%s' "$C_Y" "$EXPORT_ATT_FAIL" "$C_0" > /dev/tty
+    printf '.\n' > /dev/tty
+  fi
+  [[ -n "$final_md" ]] && printf 'Markdown: %s\n' "$final_md" > /dev/tty
+  if [[ -n "$final_pdf" && "$pdf_ok" -eq 1 ]]; then
+    printf 'PDF: %s\n' "$final_pdf" > /dev/tty
+  elif [[ -n "$final_pdf" ]]; then
+    printf 'PDF failed. Markdown was kept.\n' > /dev/tty
+  fi
+  printf '%s\n' "$shut_msg" > /dev/tty
+  if exports_managed "$dest"; then
+    exports_claim
+    printf '%sThese files are deleted when fingeronit closes. Move what you want to keep out of %s.%s\n' \
+      "$C_Y" "$(tilde "$EXPORT_HOME")" "$C_0" > /dev/tty
+  fi
+  LAST_EXPORT_DIR="$dest"
+  if [[ "$EXPORT_OPEN" -eq 1 && "${FINGERONIT_NO_OPEN:-0}" != 1 ]]; then
+    local show="$final_md"
+    [[ -n "$final_pdf" && "$pdf_ok" -eq 1 ]] && show="$final_pdf"
+    open "$show" 2>/dev/null && printf 'Opened %s\n' "$show" > /dev/tty
+  fi
+  return 0
+}
+
+# ---- exports are temporary ------------------------------------------------
+# Exports are plain copies of mail, readable by anything running as you. The
+# default folder, ~/fingeronit-export, is deleted when fingeronit closes. Before that, fingeronit asks you to move out what
+# you want to keep. Ctrl-C does not skip the question. A hang-up or a kill
+# cannot ask, so those delete straight away.
+tilde() {
+  case "$1" in
+    "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+exports_home_ok() {
+  [[ "$HOME" == /* && "${#HOME}" -gt 1 && -d "$HOME" ]]
+}
+
+exports_managed() {
+  local d="$1"
+  case "$d" in
+    "$EXPORT_HOME"|"$EXPORT_HOME"/*) return 0 ;;
+  esac
+  return 1
+}
+
+exports_count_in() {
+  [[ -d "$1" ]] || { printf 0; return; }
+  find "$1" -type f ! -name .DS_Store ! -name .fingeronit-owner 2>/dev/null | wc -l | tr -d ' '
+}
+
+exports_count() {
+  exports_home_ok || { printf 0; return; }
+  exports_count_in "$EXPORT_HOME"
+}
+
+exports_line() {
+  local n
+  n="$(exports_count)"
+  if [[ "$n" -eq 0 ]]; then
+    printf 'none waiting'
+  else
+    printf '%s files in %s. Deleted when fingeronit closes.' "$n" "$(exports_where)"
+  fi
+}
+
+exports_where() {
+  [[ "$(exports_count_in "$EXPORT_HOME")" -gt 0 ]] && tilde "$EXPORT_HOME"
+  return 0
+}
+
+exports_wipe() {
+  exports_home_ok || return 0
+  [[ -d "$EXPORT_HOME" ]] && shred_path "$EXPORT_HOME"
+  return 0
+}
+
+# Which fingeronit the waiting exports belong to: its pid and start time, in
+# ~/fingeronit-export/.fingeronit-owner. A fingeronit killed outright (kill -9, power loss)
+# cannot delete its exports, so the next fingeronit finds an owner that is gone,
+# adopts them, says so, and deletes them when it closes. Exports owned by a
+# fingeronit still running in another terminal are left to that one.
+EXPORT_OWNER=".fingeronit-owner"
+EXPORTS_ADOPTED=0
+
+exports_owner_pid() {
+  local who
+  who="$$"
+  if lock_is_ours 2>/dev/null; then
+    who="$(lock_pid)"
+  fi
+  printf '%s' "$who"
+}
+
+# A process's start time, trimmed: ps pads it with spaces.
+proc_started() {
+  ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'
+}
+
+exports_claim() {
+  EXPORTS_ADOPTED=0
+  exports_home_ok || return 0
+  local who
+  who="$(exports_owner_pid)"
+  [[ "$who" =~ ^[0-9]+$ ]] || return 0
+  mkdir -p "$EXPORT_HOME" 2>/dev/null || return 0
+  chmod 700 "$EXPORT_HOME" 2>/dev/null || true
+  printf '%s %s\n' "$who" "$(proc_started "$who")" > "$EXPORT_HOME/$EXPORT_OWNER" 2>/dev/null || return 0
+  chmod 600 "$EXPORT_HOME/$EXPORT_OWNER" 2>/dev/null || true
+}
+
+# True when the exports belong to some other fingeronit that is still running.
+exports_owned_elsewhere() {
+  local f="$EXPORT_HOME/$EXPORT_OWNER" pid="" started="" now
+  [[ -f "$f" ]] || return 1
+  read -r pid started < "$f" || true
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$pid" == "$(exports_owner_pid)" ]] && return 1
+  now="$(proc_started "$pid" || true)"
+  [[ -n "$now" && "$now" == "$started" ]] || return 1
+  ps -o command= -p "$pid" 2>/dev/null | grep -q fingeronit
+}
+
+exports_adopt() {
+  exports_home_ok || return 0
+  [[ "$(exports_count)" -gt 0 ]] || return 0
+  exports_owned_elsewhere && return 0
+  local f="$EXPORT_HOME/$EXPORT_OWNER" pid=""
+  if [[ -f "$f" ]]; then
+    read -r pid _ < "$f" || true
+    [[ "$pid" == "$(exports_owner_pid)" ]] && return 0
+  fi
+  exports_claim
+  EXPORTS_ADOPTED=1
+  if [[ -t 2 && "${1:-}" != quiet ]]; then
+    printf '%sExports from a fingeronit that did not close (a kill, a crash, or power loss) are still in %s. This fingeronit deletes them when it closes.%s\n' \
+      "${C_Y:-}" "$(exports_where)" "${C_0:-}" >&2
+  fi
+}
+
+exports_farewell_draw() {
+  local note="$1" a
+  a="$(exports_count_in "$EXPORT_HOME")"
+  {
+    printf '\033[H\033[2J'
+    printf '%sfingeronit%s  %sbefore it closes%s\n\n' "${C_B:-}" "${C_0:-}" "${C_D:-}" "${C_0:-}"
+    [[ -d "$EXPORT_HOME" ]] && printf '  %-34s %s files\n' "$(tilde "$EXPORT_HOME")" "$a"
+    printf '\n  These are plain copies of your mail. Anything running as you can read\n'
+    printf '  them, so fingeronit deletes this folder when it closes.\n\n'
+    printf '  %sMove anything you want to keep out of it now.%s\n\n' "${C_Y:-}" "${C_0:-}"
+    printf '    o   open in Finder\n'
+    printf '    d   done: delete what is left and close\n'
+    [[ -n "$note" ]] && printf '\n  %s\n' "$note"
+  } > /dev/tty
+}
+
+exports_farewell() {
+  [[ "$FAREWELL_ON" -eq 1 ]] || return 0
+  FAREWELL_ON=0
+  exports_home_ok || return 0
+  local n
+  n="$(exports_count)"
+  if exports_owned_elsewhere; then
+    printf 'fingeronit: the exports in %s belong to a fingeronit in another terminal. Left them for it.\n' \
+      "$(exports_where)" > /dev/tty 2>/dev/null || true
+    return 0
+  fi
+  if [[ "$n" -eq 0 ]]; then
+    exports_wipe
+    return 0
+  fi
+  local ask=1
+  [[ "$CAUGHT" == TERM || "$CAUGHT" == HUP ]] && ask=0
+  [[ -t 0 && -t 1 ]] || ask=0
+  { : < /dev/tty; } 2>/dev/null || ask=0
+  if [[ "$ask" -eq 0 ]]; then
+    exports_wipe
+    printf 'fingeronit: deleted %s exported files on the way out.\n' "$n" > /dev/tty 2>/dev/null \
+      || printf 'fingeronit: deleted %s exported files on the way out.\n' "$n" >&2 2>/dev/null || true
+    return 0
+  fi
+  local old key note="" last="" now drawn=0
+  FW_INT=0
+  trap 'FW_INT=1' INT
+  old="$(stty -g < /dev/tty 2>/dev/null || true)"
+  # Signal keys off, so Ctrl-C arrives here as a key instead of ending fingeronit.
+  stty -echo -icanon -isig min 0 time 10 < /dev/tty 2>/dev/null || true
+  while true; do
+    now="$(exports_count_in "$EXPORT_HOME")"
+    if [[ "$drawn" -eq 0 || "$now" != "$last" ]]; then
+      exports_farewell_draw "$note"
+      last="$now"
+      drawn=1
+    fi
+    # bash's own read -n would switch signal keys back on, so read one byte with dd.
+    key="$(dd bs=1 count=1 < /dev/tty 2>/dev/null; printf x)"
+    key="${key%x}"
+    if [[ "$FW_INT" -eq 1 ]]; then
+      FW_INT=0
+      note="Ctrl-C does not skip this. Move what you want to keep, then press d."
+      drawn=0
+      continue
+    fi
+    case "$key" in
+      "") ;;
+      $'\003'|$'\034'|$'\032')
+        note="Ctrl-C does not skip this. Move what you want to keep, then press d."
+        drawn=0
+        ;;
+      o|O)
+        [[ -d "$EXPORT_HOME" ]] && open "$EXPORT_HOME" 2>/dev/null
+        note="Opened in Finder. Drag out what you want to keep, then press d."
+        drawn=0
+        ;;
+      d|D) break ;;
+      *)
+        note="o opens the folder. d deletes what is left and closes."
+        drawn=0
+        ;;
+    esac
+  done
+  [[ -n "$old" ]] && stty "$old" < /dev/tty 2>/dev/null
+  trap - INT
+  n="$(exports_count)"
+  exports_wipe
+  printf '\033[H\033[2J' > /dev/tty
+  if [[ "$n" -eq 0 ]]; then
+    printf 'The export folder was empty. Removed it.\n' > /dev/tty
+  else
+    printf 'Deleted %s exported files. The export folder is gone.\n' "$n" > /dev/tty
+  fi
+}
+
+# ---- an older HEY CLI login, outside this box -----------------------------
+# A setup made before fingeronit may have left an older HEY CLI login in
+# ~/.config/hey-cli or in the login keychain under HEY's service name, "hey".
+# Either one works for any copy of hey, with no fingerprint.
+old_login_found() {
+  [[ -e "$HOME/.config/hey-cli" ]] && return 0
+  "$SECURITY" find-generic-password -s hey > /dev/null 2>&1
+}
+
+old_keychain_accounts() {
+  "$SECURITY" dump-keychain 2>/dev/null | awk -F'<blob>=' '
+    /^keychain: / { if (svc == "\"hey\"" && acct != "") print acct; svc = ""; acct = "" }
+    /"svce"<blob>=/ { svc = $2 }
+    /"acct"<blob>=/ { acct = $2 }
+    END { if (svc == "\"hey\"" && acct != "") print acct }' | sed 's/^"//; s/"$//'
+}
+
+cmd_clean_old() {
+  require_tty
+  local dir="$HOME/.config/hey-cli" accts f word gone=0 tries=0 any=0
+  printf 'An older HEY CLI login can sit outside this box.\n\n' > /dev/tty
+  if [[ -e "$dir" ]]; then
+    any=1
+    printf '  folder    ~/.config/hey-cli\n' > /dev/tty
+    while IFS= read -r f; do
+      printf '              %s\n' "${f#"$dir"/}" > /dev/tty
+    done < <(find "$dir" -mindepth 1 -maxdepth 2 2>/dev/null | sort | head -n 20)
+  fi
+  accts="$(old_keychain_accounts || true)"
+  if [[ -n "$accts" ]] || "$SECURITY" find-generic-password -s hey > /dev/null 2>&1; then
+    any=1
+    printf '  keychain  items under the service name "hey"\n' > /dev/tty
+    while IFS= read -r f; do
+      [[ -n "$f" ]] && printf '              account %s\n' "$f" > /dev/tty
+    done <<< "$accts"
+  fi
+  if [[ "$any" -eq 0 ]]; then
+    printf 'Nothing old here. ~/.config/hey-cli is gone and the keychain has no "hey" items.\n' > /dev/tty
+    return 0
+  fi
+  printf '\nThis deletes them from this Mac. The fingeronit login is separate and stays.\n' > /dev/tty
+  ask word 'Type REMOVE: ' || true
+  [[ "$word" == "REMOVE" ]] || { fail "left it alone" || return; return; }
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    "$SECURITY" delete-generic-password -s hey -a "$f" > /dev/null 2>&1 && gone=$((gone + 1))
+  done <<< "$accts"
+  while "$SECURITY" find-generic-password -s hey > /dev/null 2>&1 && [[ "$tries" -lt 20 ]]; do
+    "$SECURITY" delete-generic-password -s hey > /dev/null 2>&1 && gone=$((gone + 1))
+    tries=$((tries + 1))
+  done
+  [[ -e "$dir" ]] && shred_path "$dir"
+  if old_login_found; then
+    fail "something is still there. Check ~/.config/hey-cli and Keychain Access for \"hey\"." || return
+    return
+  fi
+  printf 'Removed ~/.config/hey-cli and %s keychain item(s).\n' "$gone" > /dev/tty
+  printf 'HEY may still list that older sign-in as connected. On hey.com, remove any\n' > /dev/tty
+  printf 'sign-in you do not recognize. Keep the one fingeronit uses.\n' > /dev/tty
+}
+
+# ---- the menu -------------------------------------------------------------
+# One screen. Arrows (or j/k) move, enter or a number picks, q goes back.
+# Every action ends on "Press any key", so its output stays readable.
+
+MENU_NOTE=""
+LAST_SENDER=""
+LAST_EXPORT_DIR=""
+
+if [[ -t 1 && "${TERM:-dumb}" != "dumb" && -z "${NO_COLOR:-}" ]]; then
+  C_B=$'\033[1m' C_D=$'\033[2m' C_R=$'\033[31m' C_G=$'\033[32m' C_Y=$'\033[33m' C_I=$'\033[7m' C_0=$'\033[0m'
+else
+  C_B="" C_D="" C_R="" C_G="" C_Y="" C_I="" C_0=""
+fi
+
+keys_raw() {
+  PICKER_STTY="$(stty -g < /dev/tty)"
+  stty -echo -icanon -isig min 1 time 0 < /dev/tty
+}
+
+# Wait for one key. o opens the last export folder when there is one.
+pause_key() {
+  local msg="Press any key for the menu."
+  if [[ -n "$LAST_EXPORT_DIR" ]]; then
+    msg="o opens the folder in Finder. Any other key for the menu."
+  fi
+  printf '\n%s%s%s' "$C_D" "$msg" "$C_0" > /dev/tty
+  keys_raw || return 0
+  read_picker_key || true
+  picker_restore
+  printf '\n' > /dev/tty
+  if [[ -n "$LAST_EXPORT_DIR" && ( "$PICK_KEY" == o || "$PICK_KEY" == O ) ]]; then
+    open "$LAST_EXPORT_DIR" 2>/dev/null || true
+  fi
+  LAST_EXPORT_DIR=""
+}
+
+screen_title() {
+  printf '\033[H\033[2J' > /dev/tty
+  printf '%sfingeronit%s  %s%s%s\n\n' "$C_B" "$C_0" "$C_D" "$1" "$C_0" > /dev/tty
+}
+
+# One plain sentence for where things stand.
+state_line() {
+  local name="$1" door="$2" seal="$3"
+  case "$door" in
+    mine)  printf '%sOpen in this session.%s These choices use the open door. exit at the prompt seals it.' "$C_Y" "$C_0" ;;
+    other) printf '%sBusy.%s A fingeronit in another terminal (%s) has the door. Finish there, then r.' "$C_Y" "$C_0" "$(lock_tty)" ;;
+    stale) printf '%sLeft open.%s A session crashed with the login unsealed. Reseal it first.' "$C_R" "$C_0" ;;
+    *)
+      if [[ "$seal" == "yes" ]]; then
+        printf '%sLocked.%s Your login is sealed. Each choice asks for a fingerprint.' "$C_G" "$C_0"
+      else
+        printf 'No login yet. Sign in once and it gets sealed.'
+      fi
+      ;;
+  esac
+}
+
+menu_items() {
+  local name="$1" door seal
+  provider_load "$name"
+  door="$(door_state)"
+  seal="$(seal_state "$name")"
+  case "$door" in
+    stale)
+      printf 'reseal\tReseal the crashed session\tputs the login back in the seal\n'
+      ;;
+    mine)
+      printf 'run\tRun a %s command\tthrough this session\n' "$(provider_cmdname)"
+      printf 'export\tExport mail from a sender\tone file, markdown or pdf\n'
+      ;;
+    other) : ;;
+    *)
+      if [[ "$seal" == "no" ]]; then
+        printf 'login\tSign in\tHEY or Gmail, then sealed\n'
+      else
+        printf 'export\tExport mail from a sender\tpick threads, get one file\n'
+        provider_has_contacts && printf 'tui\tBrowse mail\tHEY'"'"'s full-screen view, shuts on quit\n'
+        printf 'run\tRun a %s command\tone command, then shut\n' "$(provider_cmdname)"
+        printf 'session\tOpen a shell session\t%s works until you exit\n' "$(provider_cmdname)"
+      fi
+      ;;
+  esac
+  if [[ "$MENU_OLD" -eq 1 && "$door" != "mine" ]]; then
+    printf 'cleanold\tRemove an older HEY CLI login\t~/.config/hey-cli and keychain "hey"\n'
+  fi
+  if [[ "$door" == "shut" || "$door" == "self" ]]; then
+    printf 'switch\tSwitch instance\tnow %s\n' "$name"
+    [[ "$seal" == "yes" ]] && printf 'destroy\tDestroy this sign-in\tshreds the seal and key\n'
+  fi
+  printf 'doctor\tCheck this box\tcommands, flags, tools. No unlock\n'
+  printf 'help\tHelp\twhat the lock is, and keys\n'
+}
+
+menu_draw() {
+  local name="$1" door="$2" i n
+  local seal
+  seal="$(seal_state "$name")"
+  provider_load "$name"
+  screen_title "a finger on every email action  $FINGERONIT_VERSION"
+  if [[ "$(stat -f %m "$BIN/fingeronit" 2>/dev/null || printf 0)" != "$SELF_MTIME" ]]; then
+    printf '  %sfingeronit was updated on disk. Quit and start it again to use the new one.%s\n\n' "$C_Y" "$C_0" > /dev/tty
+  fi
+  printf '  %-9s %s\n' instance "$name" > /dev/tty
+  if [[ "$seal" == "yes" ]]; then
+    printf '  %-9s %s\n' provider "$(provider_title)" > /dev/tty
+  else
+    printf '  %-9s %s\n' provider "none yet (you pick at sign-in)" > /dev/tty
+  fi
+  printf '  %-9s %s\n' seal "$seal" > /dev/tty
+  printf '  %-9s %s\n' door "$(door_label)" > /dev/tty
+  printf '  %-9s %s\n\n' keeper "$(keeper_label)" > /dev/tty
+  printf '  %s\n\n' "$(state_line "$name" "$door" "$seal")" > /dev/tty
+  if [[ "$MENU_EXPORTS" -gt 0 ]] && exports_owned_elsewhere; then
+    printf '  %s%s exported files in %s belong to a fingeronit in another terminal. It deletes them when it closes.%s\n\n' \
+      "$C_Y" "$MENU_EXPORTS" "$(exports_where)" "$C_0" > /dev/tty
+  elif [[ "$MENU_EXPORTS" -gt 0 ]]; then
+    if [[ "$EXPORTS_ADOPTED" -eq 1 ]]; then
+      printf '  %sA fingeronit that did not close (a kill, a crash, or power loss) left these behind.%s\n' \
+        "$C_Y" "$C_0" > /dev/tty
+    fi
+    printf '  %s%s exported files wait in %s. Quitting deletes them, so move out what you want to keep.%s\n\n' \
+      "$C_Y" "$MENU_EXPORTS" "$(exports_where)" "$C_0" > /dev/tty
+  fi
+  if [[ "$MENU_OLD" -eq 1 ]]; then
+    printf '  %sAn older HEY CLI login sits outside this box. "Remove an older HEY CLI login" deletes it.%s\n\n' \
+      "$C_R" "$C_0" > /dev/tty
+  fi
+  n="${#MENU_KEYS[@]}"
+  i=0
+  while [[ "$i" -lt "$n" ]]; do
+    if [[ "$i" -eq "$MENU_CURSOR" ]]; then
+      printf ' %s> %d  %-28s%s %s%s%s\n' "$C_I" $((i + 1)) "${MENU_LABELS[$i]}" "$C_0" "$C_D" "${MENU_HINTS[$i]}" "$C_0" > /dev/tty
+    else
+      printf '   %d  %-28s %s%s%s\n' $((i + 1)) "${MENU_LABELS[$i]}" "$C_D" "${MENU_HINTS[$i]}" "$C_0" > /dev/tty
+    fi
+    i=$((i + 1))
+  done
+  if [[ "$door" == "mine" ]]; then
+    printf '   0  Back to the session\n' > /dev/tty
+  else
+    printf '   0  Quit\n' > /dev/tty
+  fi
+  if [[ -n "$MENU_NOTE" ]]; then
+    printf '\n  %s\n' "$MENU_NOTE" > /dev/tty
+  fi
+  printf '\n%sChoose: arrows and enter, or a number. r refreshes. q quits.%s ' "$C_D" "$C_0" > /dev/tty
+}
+
+# Sets MENU_PICK to an item key, "quit", or "refresh".
+menu_choose() {
+  local name="$1" door="$2" n
+  n="${#MENU_KEYS[@]}"
+  MENU_PICK=""
+  keys_raw || { MENU_PICK=quit; return; }
+  while [[ -z "$MENU_PICK" ]]; do
+    menu_draw "$name" "$door"
+    MENU_NOTE=""
+    if ! read_picker_key; then
+      MENU_PICK=quit
+      break
+    fi
+    case "$PICK_KEY" in
+      $'\e[A'|$'\eOA'|k)
+        if [[ "$MENU_CURSOR" -gt 0 ]]; then MENU_CURSOR=$((MENU_CURSOR - 1)); else MENU_CURSOR=$((n - 1)); fi
+        ;;
+      $'\e[B'|$'\eOB'|j|$'\t')
+        if [[ "$MENU_CURSOR" -lt $((n - 1)) ]]; then MENU_CURSOR=$((MENU_CURSOR + 1)); else MENU_CURSOR=0; fi
+        ;;
+      $'\n'|$'\r'|' ') MENU_PICK="${MENU_KEYS[$MENU_CURSOR]}" ;;
+      0|q|Q|$'\e'|$'\004') MENU_PICK=quit ;;
+      r|R) MENU_PICK=refresh ;;
+      '?'|h) MENU_PICK=help ;;
+      [1-9])
+        if [[ "$PICK_KEY" -le "$n" ]]; then
+          MENU_CURSOR=$((PICK_KEY - 1))
+          MENU_PICK="${MENU_KEYS[$MENU_CURSOR]}"
+        else
+          MENU_NOTE="No choice $PICK_KEY."
+        fi
+        ;;
+    esac
+  done
+  picker_restore
+  printf '\n' > /dev/tty
+}
+
+menu_help() {
+  screen_title "help"
+  cat > /dev/tty <<EOF
+  ${C_B}Keys${C_0}
+    arrows or j/k   move          enter or a number   choose
+    r               refresh       q or 0              quit, or back to the session
+    in the export list: space ticks, a ticks all, n ticks none, enter writes
+
+  ${C_B}What the lock is${C_0}
+    Your mail provider (HEY or Gmail) signs you in. This box keeps that login
+    sealed on disk and lets it out only after Touch ID (or your Mac password),
+    in this terminal. A pipe or an agent with no
+    terminal is refused. Cancel any fingerprint prompt you did not just ask for.
+
+    While something is open, the keeper holds the login: $(keeper_label).
+    The menu seals it again before it shows you the next choice. An open
+    door also closes itself after $(idle_label "$(idle_seconds)") with no keys pressed
+    (idle_minutes in lockenv.cfg).
+
+  ${C_B}The choices${C_0}
+    Export        pick threads from one sender, get one markdown or pdf file
+                  in ~/fingeronit-export. Attachments go next to it. That folder is
+                  deleted when fingeronit closes; move out what you want to keep.
+    Browse mail   HEY's own full-screen view (HEY only). Quitting it shuts the door.
+    Run           one hey or gmail command, like: box list. "help" needs no unlock.
+                  Quotes work. A fingeronit export typed here runs as one.
+    Session       a shell where hey (or gmail) works. fingeronit in there shows this menu.
+    Check         fingeronit doctor: checksum, each provider's flags, tools.
+                  Never unlocks. Run it after HEY or gmail.py changes.
+    Destroy       shreds this instance's seal and key. Disconnect the
+                  sign-in at hey.com or Google too if you want the grant gone.
+
+  ${C_B}From the shell${C_0}
+    fingeronit login [--provider hey|gmail] | status | session | run -- <args> | seal-live | clean-old | destroy [--all]
+EOF
+}
+
+menu_switch() {
+  local current="$1" dir names="" pick
+  shopt -s nullglob
+  for dir in "$INSTANCES"/*; do
+    [[ -d "$dir" ]] && names="$names $(basename "$dir")"
+  done
+  shopt -u nullglob
+  printf 'Instances:%s\n' "${names:- none yet}" > /dev/tty
+  ask pick "$(printf 'Switch to (enter keeps %s): ' "$current")" || pick=""
+  if [[ -z "$pick" || "$pick" == "$current" ]]; then
+    MENU_NOTE="Still on $current."
+    return 0
+  fi
+  if ! valid_name "$pick"; then
+    MENU_NOTE="Names are letters, numbers, dot, dash, or underscore."
+    return 0
+  fi
+  MENU_NAME="$pick"
+  MENU_NOTE="Switched to $pick."
+}
+
+menu_run() {
+  local name="$1" door="$2"
+  local -a hey_args=()
+  provider_load "$name"
+  local cmdname
+  cmdname="$(provider_cmdname)"
+  screen_title "run a $cmdname command"
+  if [[ "$door" == "mine" ]]; then
+    printf 'Runs through this session. No fingerprint.\n' > /dev/tty
+  else
+    printf 'One fingerprint, one command, then the door shuts.\n' > /dev/tty
+  fi
+  printf '%sExamples: box list    help (no unlock)    Enter alone goes back.%s\n\n' "$C_D" "$C_0" > /dev/tty
+  local line="" w
+  local st=0
+  ask line "$cmdname > " || st=$?
+  if [[ "$st" -eq 130 ]]; then
+    return 0
+  elif [[ "$st" -ne 0 ]]; then
+    printf '\n' > /dev/tty
+    return 1
+  fi
+  while IFS= read -r -d '' w; do
+    hey_args+=("$w")
+  done < <(python3 -I -c 'import shlex, sys
+try:
+    words = shlex.split(sys.argv[1])
+except ValueError:
+    sys.exit(1)
+sys.stdout.write("".join(x + "\0" for x in words))' "$line")
+  if [[ "${#hey_args[@]}" -eq 0 ]]; then
+    if [[ "$line" =~ [^[:space:]] ]]; then
+      MENU_NOTE="Could not read that line. Is a quote left open?"
+    else
+      MENU_NOTE="Nothing run."
+    fi
+    return 1
+  fi
+  [[ "${hey_args[0]}" == "$cmdname" ]] && hey_args=("${hey_args[@]:1}")
+  [[ "${#hey_args[@]}" -gt 0 ]] || { MENU_NOTE="Nothing run."; return 1; }
+  if [[ "${hey_args[0]}" == "fingeronit" || "${hey_args[0]}" == */fingeronit ]]; then
+    if [[ "${hey_args[1]:-}" == "export" ]]; then
+      printf '\nThat is a fingeronit export. Running it as one.\n\n' > /dev/tty
+      export_reset
+      cmd_export_flags --instance "$name" "${hey_args[@]:2}" || true
+      export_reset
+      return 0
+    fi
+    MENU_NOTE="That is a fingeronit command, not a $cmdname one. Pick it from this menu, or quit and run it in the shell."
+    return 1
+  fi
+  printf '\n' > /dev/tty
+  cmd_run "$name" "${hey_args[@]}" || true
+}
+
+menu_login() {
+  local name="$1" pick="" prov
+  ask pick "Provider [1 HEY, 2 Gmail] [1]: " || { printf 'Nothing signed in.\n' > /dev/tty; return 0; }
+  case "$pick" in
+    ""|1|hey|HEY|Hey) prov=hey ;;
+    2|gmail|Gmail|GMAIL) prov=gmail ;;
+    *) printf 'No such provider. Pick 1 or 2.\n' > /dev/tty; return 0 ;;
+  esac
+  cmd_login --provider "$prov" "$name"
+}
+
+# Each action returns 0 to pause on its output, 1 to go straight back.
+menu_do() {
+  local name="$1" key="$2" door="$3"
+  case "$key" in
+    login) screen_title "sign in"; menu_login "$name" || true ;;
+    session)
+      screen_title "session"
+      cmd_session "$name" || { pause_key; return; }
+      MENU_NOTE="Session closed. The door is shut."
+      return 1
+      ;;
+    tui) cmd_run "$name" tui || true ;;
+    run) menu_run "$name" "$door" || return 1 ;;
+    export) screen_title "export"; cmd_export "$name" || true ;;
+    status) cmd_status "$name" || true ;;
+    reseal) cmd_seal_live || true ;;
+    destroy) screen_title "destroy"; cmd_destroy "$name" || true ;;
+    switch) menu_switch "$name"; return 1 ;;
+    help) menu_help ;;
+    doctor) screen_title "check"; cmd_doctor "$name" || true ;;
+    cleanold) screen_title "remove an older HEY CLI login"; cmd_clean_old || true ;;
+    *) return 1 ;;
+  esac
+  pause_key
+}
+
+cmd_menu() {
+  require_tty
+  IN_MENU=1
+  MENU_NAME="$DEFAULT_NAME"
+  MENU_CURSOR=0
+  local door line key label hint last_door=""
+  local -a MENU_KEYS MENU_LABELS MENU_HINTS
+  MENU_EXPORTS=0
+  MENU_OLD=0
+  while true; do
+    if [[ "$(door_state)" == "self" ]]; then
+      close_door || exit 1
+    fi
+    refresh_orphan
+    MENU_EXPORTS="$(exports_count)"
+    MENU_OLD=0
+    old_login_found && MENU_OLD=1
+    door="$(door_state)"
+    [[ "$door" == "mine" ]] && MENU_NAME="$(lock_instance)"
+    MENU_KEYS=() MENU_LABELS=() MENU_HINTS=()
+    while IFS=$'\t' read -r key label hint; do
+      [[ -n "$key" ]] || continue
+      MENU_KEYS+=("$key")
+      MENU_LABELS+=("$label")
+      MENU_HINTS+=("$hint")
+    done < <(menu_items "$MENU_NAME")
+    if [[ "$door" != "$last_door" || "$MENU_CURSOR" -ge "${#MENU_KEYS[@]}" ]]; then
+      MENU_CURSOR=0
+    fi
+    last_door="$door"
+    menu_choose "$MENU_NAME" "$door"
+    case "$MENU_PICK" in
+      refresh) continue ;;
+      quit)
+        refresh_orphan
+        door="$(door_state)"
+        case "$door" in
+          self) close_door || exit 1; printf 'Door shut.\n' > /dev/tty; break ;;
+          stale) MENU_NOTE="The login is still unsealed on disk. Reseal before you quit."; continue ;;
+          mine) printf 'Back to session %s. exit seals it.\n' "$(lock_instance)" > /dev/tty; break ;;
+          other) printf 'Left the other door alone.\n' > /dev/tty; break ;;
+          *) printf 'Door shut.\n' > /dev/tty; break ;;
+        esac
+        ;;
+      *)
+        menu_do "$MENU_NAME" "$MENU_PICK" "$door" || true
+        ;;
+    esac
+  done
+}
+
+# fingeronit export [--from ADDR | --with ADDR]... [--days N | --all-time] [--md|--pdf|--both]
+# --with gathers everything to and from the address, drafts included.
+#               [--to DIR] [--open] [--instance NAME] [--autopilot-test]
+# Any --from makes it run straight through: every thread, no picker.
+export_reset() {
+  EXPORT_AUTO=0
+  EXPORT_SENDERS=()
+  EXPORT_MODE=""
+  EXPORT_DAYS=""
+  EXPORT_KIND=""
+  EXPORT_DEST=""
+  EXPORT_OPEN=0
+}
+
+cmd_export_flags() {
+  local name="$DEFAULT_NAME"
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --autopilot-test)
+        EXPORT_AUTO=1
+        EXPORT_OPEN=1
+        [[ "${#EXPORT_SENDERS[@]}" -gt 0 ]] || EXPORT_SENDERS=("$EXAMPLE_SENDER")
+        ;;
+      --from) [[ "$#" -ge 2 ]] || { fail "--from needs an address" || return; return; }; EXPORT_SENDERS+=("$2"); EXPORT_AUTO=1; shift ;;
+      --with) [[ "$#" -ge 2 ]] || { fail "--with needs an address" || return; return; }; EXPORT_SENDERS+=("$2"); EXPORT_MODE=all; EXPORT_AUTO=1; shift ;;
+      --days) [[ "$#" -ge 2 ]] || { fail "--days needs a number" || return; return; }; EXPORT_DAYS="$2"; shift ;;
+      --all-time) EXPORT_DAYS=0 ;;
+      --md) EXPORT_KIND=md ;;
+      --pdf) EXPORT_KIND=pdf ;;
+      --both) EXPORT_KIND=both ;;
+      --to) [[ "$#" -ge 2 ]] || { fail "--to needs a folder" || return; return; }; EXPORT_DEST="$2"; shift ;;
+      --open) EXPORT_OPEN=1 ;;
+      --instance) [[ "$#" -ge 2 ]] || { fail "--instance needs a name" || return; return; }; name="$2"; shift ;;
+      -*) fail "unknown export flag: $1 (try: fingeronit help)" || return; return ;;
+      *) name="$1" ;;
+    esac
+    shift
+  done
+  if [[ "$EXPORT_AUTO" -eq 1 && "${#EXPORT_SENDERS[@]}" -gt 1 ]]; then
+    # --autopilot-test plus --from: the --from addresses win
+    local -a keep=()
+    local one
+    for one in "${EXPORT_SENDERS[@]}"; do
+      [[ "$one" == "$EXAMPLE_SENDER" ]] || keep+=("$one")
+    done
+    [[ "${#keep[@]}" -gt 0 ]] && EXPORT_SENDERS=("${keep[@]}")
+  fi
+  cmd_export "$name"
+}
+
+# ---- leftovers from abandoned sessions --------------------------------------
+# A fingeronit killed hard, or a Mac that lost power, can leave its scratch behind:
+# folders under var/live (an unsealed login can be among them) and working
+# folders in /tmp. With no door open anywhere, none of it belongs to anyone,
+# so it is shredded on the way in. /tmp is shared with other fingeronit copies, so
+# a folder there must be an hour old and in use by no process.
+sweep_tmp_leftovers() {
+  local p me
+  me="$(id -u)"
+  while IFS= read -r -d '' p; do
+    if lsof -t +d "$p" > /dev/null 2>&1; then
+      continue
+    fi
+    printf '%s\0' "$p"
+  done < <(find /tmp/ -maxdepth 1 -type d \( -name 'fingeronit-cwd.*' -o -name 'fingeronit-off.*' \) \
+    -user "$me" -mmin +60 -print0 2>/dev/null)
+}
+
+sweep_abandoned() {
+  refresh_orphan
+  [[ "$(door_state)" == "shut" ]] || return 0
+  keeper_is_open && return 0
+  local p n=0
+  local -a live=() tmps=()
+  for p in xdg home tmp runtime pack zdot key instance cwdpath; do
+    [[ -e "$LIVE/$p" || -L "$LIVE/$p" ]] && live+=("$p")
+  done
+  while IFS= read -r -d '' p; do
+    tmps+=("$p")
+  done < <(sweep_tmp_leftovers)
+  n=$(( ${#live[@]} + ${#tmps[@]} ))
+  [[ "$n" -gt 0 ]] || return 0
+  if [[ "${#live[@]}" -gt 0 ]]; then
+    clear_live
+  fi
+  for p in "${tmps[@]+"${tmps[@]}"}"; do
+    shred_path "$p"
+  done
+  if [[ -t 2 ]]; then
+    printf '%sCleaned up after an abandoned fingeronit session:' "${C_Y:-}" >&2
+    [[ "${#live[@]}" -gt 0 ]] && printf ' var/live (%s)' "${live[*]}" >&2
+    [[ "${#tmps[@]}" -gt 0 ]] && printf ' and %s old folder%s in /tmp' "${#tmps[@]}" "$([[ "${#tmps[@]}" -eq 1 ]] || printf s)" >&2
+    printf '.%s\n' "${C_0:-}" >&2
+  fi
+  if [[ -d "$(instance_dir "$DEFAULT_NAME")" ]]; then
+    audit "$DEFAULT_NAME" sweep "live=${#live[@]}" "tmp=${#tmps[@]}" 2>/dev/null || true
+  fi
+}
+
+main() {
+  if [[ -p /dev/fd/3 ]]; then
+    IFS= read -r -t 2 HB_TICKET <&3 || HB_TICKET=""
+    exec 3<&-
+    [[ "$HB_TICKET" =~ ^[0-9a-f]{48}$ ]] || HB_TICKET=""
+  fi
+  # Commands that may leave exports behind offer the farewell on the way out.
+  # A fingeronit inside a session leaves that to the session's own.
+  case "${1:-menu}" in
+    menu|export|--autopilot-test|session|run)
+      lock_is_ours || FAREWELL_ON=1
+      ;;
+  esac
+  case "${1:-menu}" in
+    menu|export|--autopilot-test|session|run|login|clean)
+      sweep_abandoned
+      ;;
+  esac
+  case "${1:-menu}" in
+    menu)
+      lock_is_ours || exports_adopt quiet
+      ;;
+    export|--autopilot-test|session|run)
+      lock_is_ours || exports_adopt
+      ;;
+  esac
+  if [[ "$#" -eq 0 ]]; then
+    cmd_menu
+    return
+  fi
+  local cmd="$1"
+  shift || true
+  case "$cmd" in
+    help|-h|--help) cmd_help ;;
+    status) cmd_status "${1:-$DEFAULT_NAME}" ;;
+    clean-old) cmd_clean_old ;;
+    clean) printf 'Nothing else is left over from earlier sessions.\n' ;;
+    login) cmd_login "$@" ;;
+    session) cmd_session "${1:-$DEFAULT_NAME}" ;;
+    seal-live) cmd_seal_live ;;
+    doctor) cmd_doctor "${1:-$DEFAULT_NAME}" ;;
+    version|--version) printf 'fingeronit %s\n' "$FINGERONIT_VERSION" ;;
+    --autopilot-test) cmd_export_flags --autopilot-test "$@" ;;
+    export) cmd_export_flags "$@" ;;
+    run)
+      local name="$DEFAULT_NAME"
+      if [[ "${1:-}" == "--" ]]; then
+        shift
+      elif [[ -n "${1:-}" && "${1:-}" != --* ]]; then
+        name="$1"
+        shift
+      fi
+      [[ "${1:-}" == "--" ]] && shift
+      cmd_run "$name" "$@"
+      ;;
+    _watchdog) cmd_watchdog "$@" ;;
+    _inside)
+      local name="${1:-}"
+      shift || true
+      [[ "${1:-}" == "--" ]] && shift
+      cmd_inside "$name" "$@"
+      ;;
+    destroy)
+      if [[ "${1:-}" == "--all" ]]; then
+        cmd_destroy_all
+      else
+        cmd_destroy "${1:-$DEFAULT_NAME}"
+      fi
+      ;;
+    *) die "unknown command: $cmd (try: fingeronit help)" ;;
+  esac
+}
+
+# One line, so an edit to this file while it runs cannot run leftover text.
+main "$@"; exit $?

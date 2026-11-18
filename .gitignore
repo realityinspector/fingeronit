@@ -1,0 +1,8 @@
+libexec/hey
+bin/finger-touch
+bin/finger-seal
+var/
+.DS_Store
+*.new
+__pycache__/
+*.pyc

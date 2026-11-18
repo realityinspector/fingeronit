@@ -1,0 +1,424 @@
+#!/bin/bash
+# The fingeronit keeper. It holds an open mail login (HEY or Gmail) so your other programs cannot.
+#
+# Installed (sudo bin/install-keeper), it lives root-owned in
+# /usr/local/libexec/fingeronit and runs as the hidden user _fingeronit through one
+# sudoers rule. The open login sits in /private/var/fingeronit, which only
+# _fingeronit can read. Anything else running as you cannot open it.
+#
+# Not installed, fingeronit runs this copy as you, with the door under var/live.
+# That works the same, but it is only as private as your user account.
+#
+# Verbs. Only run and save touch mail, and both need the door's ticket on the
+# first line of stdin plus the terminal that opened the door.
+#   state                 "shut", or "open INSTANCE TTY"
+#   open INSTANCE [PROVIDER]   PROVIDER is hey (the default) or gmail.
+#                         stdin: key as hex on one line, then config.tgz. Prints the ticket.
+#   run [--tui] [--term T] [--lang L] -- ARGS   ticket on stdin, then the provider's ARGS
+#   save ID               ticket on stdin. The provider saves one attachment; a tar comes out.
+#   keyhash               sha256 of the door's key (not a secret)
+#   close                 stop hey, seal, print "KEYHASH\n" then the sealed box, wipe
+#   stop                  hang up and then end every provider command this keeper started
+#   wipe                  stop and shred without sealing
+#   selftest              check this install
+set -euo pipefail
+umask 077
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+SYS_DIR=/usr/local/libexec/fingeronit
+if [[ "$0" == "$SYS_DIR/keeper" ]]; then
+  MODE=installed
+  HOME_DIR=/private/var/fingeronit
+  HEY="$SYS_DIR/hey"
+  GMAIL="$SYS_DIR/gmail.py"
+  SEAL="$SYS_DIR/seal"
+  [[ "$(id -un)" == "_fingeronit" ]] || { printf 'keeper: runs as _fingeronit only\n' >&2; exit 77; }
+else
+  MODE=local
+  HOME_DIR="${FINGERONIT_KEEPER_HOME:?}"
+  HEY="${FINGERONIT_KEEPER_HEY:?}"
+  GMAIL="${FINGERONIT_KEEPER_GMAIL:-}"
+  SEAL="${FINGERONIT_KEEPER_SEAL:?}"
+fi
+DOOR="$HOME_DIR/door"
+P_NAME=hey
+P_CFG=hey-cli
+P_CMD=()
+
+say() { printf 'keeper: %s\n' "$1" >&2; }
+die() { say "$1"; exit "${2:-1}"; }
+
+shred_path() {
+  local target="$1" f size
+  [[ -e "$target" || -L "$target" ]] || return 0
+  if [[ -L "$target" ]]; then rm -f "$target"; return 0; fi
+  if [[ -f "$target" ]]; then
+    size="$(wc -c < "$target" | tr -d ' ')"
+    if [[ "${size:-0}" -gt 0 ]]; then
+      dd if=/dev/urandom of="$target" bs=4096 count="$((size / 4096 + 1))" conv=notrunc 2>/dev/null || true
+    fi
+    rm -f "$target"
+    return 0
+  fi
+  if [[ -d "$target" ]]; then
+    while IFS= read -r -d '' f; do
+      [[ -L "$f" || -f "$f" ]] && shred_path "$f"
+    done < <(find "$target" -mindepth 1 -print0 2>/dev/null)
+    rm -rf "$target"
+  fi
+}
+
+# The controlling terminal of this process, which is the caller's.
+# A process cannot borrow another session's terminal for this.
+my_tty() {
+  local t
+  t="$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ')"
+  case "$t" in
+    ""|"??"|"?") printf 'none' ;;
+    /dev/*) printf '%s' "$t" ;;
+    tty*) printf '/dev/%s' "$t" ;;
+    *) printf '/dev/tty%s' "$t" ;;
+  esac
+}
+
+# ---- providers --------------------------------------------------------------
+# The provider table. bin/fingeronit carries the same one; keep them in step.
+#   hey    command $HEY                          config dir hey-cli
+#   gmail  command /usr/bin/python3 -I $GMAIL    config dir fingeronit-gmail
+# provider_set NAME fills P_NAME, P_CFG (the folder under XDG_CONFIG_HOME) and
+# P_CMD (the command words). It fails for a name that is not in the table.
+provider_set() {
+  case "$1" in
+    hey)
+      P_NAME=hey
+      P_CFG=hey-cli
+      P_CMD=("$HEY")
+      ;;
+    gmail)
+      P_NAME=gmail
+      P_CFG=fingeronit-gmail
+      [[ -n "$GMAIL" && -f "$GMAIL" ]] || die "the gmail provider is not installed" 69
+      P_CMD=(/usr/bin/python3 -I "$GMAIL")
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# The provider the open door was made for. A door without the file is hey's.
+door_provider() {
+  local p=hey
+  [[ -f "$DOOR/provider" ]] && p="$(cat "$DOOR/provider")"
+  provider_set "$p" || die "the open door names an unknown provider" 65
+}
+
+# Gmail may do only this: search, thread read, attachment list and save,
+# draft list and show, auth status, version, help.
+gmail_allowed() {
+  local a="${1:-}" b="${2:-}"
+  case "$a" in
+    search|help|version|--help|-h|--version) return 0 ;;
+    thread) [[ "$b" == read || "$b" == --help || "$b" == -h ]] ;;
+    attachment) [[ "$b" == list || "$b" == save || "$b" == --help || "$b" == -h ]] ;;
+    draft) [[ "$b" == list || "$b" == show || "$b" == --help || "$b" == -h ]] ;;
+    auth) [[ "$b" == status ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+is_open() { [[ -f "$DOOR/ticket" ]]; }
+
+# Ticket on the first line of stdin, and the same terminal that opened the door.
+check_caller() {
+  local given="" want
+  is_open || die "no door is open" 3
+  IFS= read -r given || true
+  want="$(cat "$DOOR/ticket")"
+  if [[ -z "$given" || "$given" != "$want" ]]; then
+    die "refused. This caller does not hold the open door." 77
+  fi
+  if [[ "$(my_tty)" != "$(cat "$DOOR/tty")" ]]; then
+    die "refused. The door belongs to another terminal." 77
+  fi
+}
+
+refused_shape() {
+  if [[ "$P_NAME" == gmail ]]; then
+    gmail_allowed "$@" && return 1
+    return 0
+  fi
+  # Find the command words the way hey's parser does: global flags can come
+  # first, and some of them take a value.
+  local arg skip=0
+  local -a words=()
+  for arg in "$@"; do
+    if [[ "$skip" -eq 1 ]]; then skip=0; continue; fi
+    case "$arg" in
+      --mcp|--agent|--token|--cookie|--password) return 0 ;;
+      --base-url|--base-url=*) return 0 ;;
+      -v|-vv|-vvv|--verbose|--verbose=*) return 0 ;;
+      --account|--jq|--profile|-P) skip=1 ;;
+      --) ;;
+      -*) ;;
+      *) words+=("$arg") ;;
+    esac
+  done
+  [[ "${#words[@]}" -gt 0 ]] || return 1
+  case "${words[0]}" in
+    setup|skill|mcp|plugin|commands|upgrade|shell-completion|login|logout|config)
+      return 0
+      ;;
+    auth)
+      [[ "${words[1]:-}" == "status" ]] || return 0
+      ;;
+  esac
+  return 1
+}
+
+provider_env() {
+  # Prints nothing. Sets HEY_ENV for env -i. The HEY_ names only matter to hey.
+  HEY_ENV=(
+    HOME="$DOOR/home" PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+    TERM="${KEEP_TERM:-xterm-256color}" LANG="${KEEP_LANG:-en_US.UTF-8}"
+    SHELL=/bin/zsh TMPDIR="$DOOR/tmp"
+    XDG_CONFIG_HOME="$DOOR/xdg" XDG_CACHE_HOME="$DOOR/xdg/cache"
+    XDG_DATA_HOME="$DOOR/xdg/data" XDG_STATE_HOME="$DOOR/xdg/state"
+    XDG_RUNTIME_DIR="$DOOR/runtime"
+    HEY_NO_KEYRING=1 HEY_SETUP_AGENT=none
+  )
+}
+
+track_self() {
+  mkdir -p "$DOOR/pids"
+  # The start time goes in too, so a reused pid is never mistaken for ours.
+  ps -o lstart= -p $$ > "$DOOR/pids/$$" 2>/dev/null || : > "$DOOR/pids/$$"
+}
+
+verb_state() {
+  if is_open; then
+    printf 'open %s %s\n' "$(cat "$DOOR/instance")" "$(cat "$DOOR/tty")"
+  else
+    printf 'shut\n'
+  fi
+}
+
+verb_open() {
+  local name="${1:-}" prov="${2:-hey}" tty keyhex ticket entry
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] || die "bad instance name" 64
+  provider_set "$prov" || die "unknown provider" 64
+  tty="$(my_tty)"
+  [[ "$tty" != "none" ]] || die "refused. No terminal." 77
+  mkdir -p "$HOME_DIR"
+  chmod 700 "$HOME_DIR"
+  if [[ -e "$DOOR" ]]; then
+    if [[ ! -f "$DOOR/ticket" ]]; then
+      # A half-made door from a crash. Nothing usable is in it.
+      shred_path "$DOOR"
+    else
+      die "a door is already open (instance $(cat "$DOOR/instance" 2>/dev/null))" 3
+    fi
+  fi
+  mkdir "$DOOR" || die "a door is already open" 3
+  mkdir -p "$DOOR/in" "$DOOR/xdg/cache" "$DOOR/xdg/data" "$DOOR/xdg/state" \
+    "$DOOR/home" "$DOOR/tmp" "$DOOR/runtime" "$DOOR/cwd" "$DOOR/pids"
+  IFS= read -r keyhex || true
+  if [[ ! "$keyhex" =~ ^[0-9a-f]{64}$ ]]; then
+    shred_path "$DOOR"
+    die "the key did not arrive" 65
+  fi
+  printf '%s' "$keyhex" | xxd -r -p > "$DOOR/key"
+  cat > "$DOOR/in/config.tgz"
+  while IFS= read -r entry; do
+    case "$entry" in
+      "$P_CFG"|"$P_CFG"/|"$P_CFG"/*) ;;
+      *) shred_path "$DOOR"; die "the login archive has something besides $P_CFG in it" 65 ;;
+    esac
+    case "$entry" in
+      *..*) shred_path "$DOOR"; die "the login archive has a .. path" 65 ;;
+    esac
+  done < <(tar -tzf "$DOOR/in/config.tgz" 2>/dev/null || printf 'BAD\n')
+  if ! tar -C "$DOOR/xdg" -xzf "$DOOR/in/config.tgz" 2>/dev/null; then
+    shred_path "$DOOR"
+    die "the login archive did not unpack" 65
+  fi
+  shred_path "$DOOR/in"
+  [[ -f "$DOOR/xdg/$P_CFG/credentials.json" ]] || { shred_path "$DOOR"; die "the login has no credentials" 65; }
+  chmod -R go-rwx "$DOOR"
+  printf '%s\n' "$name" > "$DOOR/instance"
+  printf '%s\n' "$P_NAME" > "$DOOR/provider"
+  printf '%s\n' "$tty" > "$DOOR/tty"
+  ticket="$(od -An -tx1 -N24 /dev/urandom | tr -d ' \n')"
+  printf '%s\n' "$ticket" > "$DOOR/ticket.new"
+  mv "$DOOR/ticket.new" "$DOOR/ticket"
+  printf '%s\n' "$ticket"
+}
+
+verb_run() {
+  local tui=0
+  KEEP_TERM="" KEEP_LANG=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --tui) tui=1 ;;
+      --term) KEEP_TERM="${2:-}"; shift ;;
+      --lang) KEEP_LANG="${2:-}"; shift ;;
+      --) shift; break ;;
+      *) die "unknown run flag $1" 64 ;;
+    esac
+    shift
+  done
+  check_caller
+  door_provider
+  [[ "$#" -gt 0 ]] || set -- help
+  if refused_shape "$@"; then
+    die "refused. setup, skills, mcp, tokens, and trust-local stay shut." 77
+  fi
+  local -a args=("$@")
+  if [[ "${args[0]}" == "auth" && "${args[1]:-}" == "status" ]]; then
+    local a seen=0
+    for a in "${args[@]}"; do [[ "$a" == "--json" ]] && seen=1; done
+    [[ "$seen" -eq 1 ]] || args+=(--json)
+  fi
+  [[ "$KEEP_TERM" =~ ^[A-Za-z0-9._+-]{1,40}$ ]] || KEEP_TERM=xterm-256color
+  [[ "$KEEP_LANG" =~ ^[A-Za-z0-9._@-]{1,40}$ ]] || KEEP_LANG=en_US.UTF-8
+  provider_env
+  [[ "$tui" -eq 1 ]] || HEY_ENV+=(HEY_NONINTERACTIVE=1)
+  track_self
+  cd "$DOOR/cwd"
+  # stdin carried the ticket. Give hey the terminal back when there is one.
+  if [[ -t 2 ]]; then
+    exec 0<&2
+  else
+    exec 0</dev/null
+  fi
+  exec env -i "${HEY_ENV[@]}" "${P_CMD[@]}" "${args[@]}"
+}
+
+verb_save() {
+  local id="${1:-}" stage rc
+  [[ "${#id}" -le 1024 && "$id" =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]*$ ]] || die "bad attachment id" 64
+  check_caller
+  door_provider
+  provider_env
+  HEY_ENV+=(HEY_NONINTERACTIVE=1)
+  stage="$DOOR/stage.$$"
+  shred_path "$stage"
+  mkdir -p "$stage"
+  mkdir -p "$DOOR/pids"
+  set +e
+  (cd "$DOOR/cwd" && exec env -i "${HEY_ENV[@]}" "${P_CMD[@]}" attachment save "$id" --output "$stage" < /dev/null > /dev/null 2>&1) &
+  local hp=$!
+  ps -o lstart= -p "$hp" > "$DOOR/pids/$hp" 2>/dev/null || : > "$DOOR/pids/$hp"
+  wait "$hp"
+  rc=$?
+  rm -f "$DOOR/pids/$hp"
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
+    COPYFILE_DISABLE=1 tar -C "$stage" -cf - .
+  fi
+  rm -rf "$stage"
+  return "$rc"
+}
+
+# The pid is still the process fingeronit started: same start time as recorded.
+pid_is_ours() {
+  local f="$1" pid="$2" now
+  now="$(ps -o lstart= -p "$pid" 2>/dev/null || true)"
+  [[ -n "$now" && "$now" == "$(cat "$f" 2>/dev/null)" ]]
+}
+
+verb_stop() {
+  local f pid comm any=0
+  [[ -d "$DOOR/pids" ]] || return 0
+  for f in "$DOOR/pids"/*; do
+    [[ -e "$f" ]] || continue
+    pid="$(basename "$f")"
+    [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" ]] || { rm -f "$f"; continue; }
+    pid_is_ours "$f" "$pid" || { rm -f "$f"; continue; }
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
+    case "$comm" in
+      */hey|hey|*/keeper|keeper|*bash*|env|*ython*) kill -HUP "$pid" 2>/dev/null && any=1 ;;
+      *) rm -f "$f" ;;
+    esac
+  done
+  [[ "$any" -eq 1 ]] || return 0
+  sleep 2
+  for f in "$DOOR/pids"/*; do
+    [[ -e "$f" ]] || continue
+    pid="$(basename "$f")"
+    if kill -0 "$pid" 2>/dev/null && pid_is_ours "$f" "$pid"; then
+      comm="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
+      case "$comm" in
+        */hey|hey|*/keeper|keeper|*bash*|env|*ython*) kill -TERM "$pid" 2>/dev/null || true ;;
+      esac
+    fi
+    rm -f "$f"
+  done
+}
+
+keyhash() { shasum -a 256 "$DOOR/key" | cut -d' ' -f1; }
+
+verb_keyhash() {
+  is_open || die "no door is open" 3
+  keyhash
+}
+
+verb_close() {
+  is_open || die "no door is open" 3
+  verb_stop
+  local tgz="$DOOR/out.tgz" box="$DOOR/out.box" hash
+  door_provider
+  [[ -f "$DOOR/xdg/$P_CFG/credentials.json" ]] || die "the open login lost its credentials" 65
+  COPYFILE_DISABLE=1 tar -C "$DOOR/xdg" -czf "$tgz" "$P_CFG"
+  "$SEAL" "$DOOR/key" < "$tgz" > "$box" || { shred_path "$tgz"; die "sealing failed. The door stays open." 65; }
+  [[ -s "$box" ]] || { shred_path "$tgz"; die "sealing wrote nothing. The door stays open." 65; }
+  hash="$(keyhash)"
+  shred_path "$tgz"
+  printf '%s\n' "$hash"
+  cat "$box"
+  shred_path "$DOOR"
+}
+
+verb_wipe() {
+  verb_stop
+  shred_path "$DOOR"
+}
+
+verb_selftest() {
+  local k bad=0 owner mode
+  printf 'keeper mode: %s, running as %s\n' "$MODE" "$(id -un)"
+  owner="$(stat -f %Su "$HOME_DIR" 2>/dev/null || printf missing)"
+  mode="$(stat -f %Lp "$HOME_DIR" 2>/dev/null || printf missing)"
+  printf 'door folder %s: owner %s, mode %s\n' "$HOME_DIR" "$owner" "$mode"
+  [[ "$owner" == "$(id -un)" && "$mode" == 700 ]] || bad=1
+  if env -i HOME="$HOME_DIR" PATH="$PATH" TMPDIR="$HOME_DIR" HEY_NO_KEYRING=1 "$HEY" version > /dev/null 2>&1; then printf 'hey runs\n'; else printf 'hey does not run\n'; bad=1; fi
+  if [[ -n "$GMAIL" && -f "$GMAIL" ]]; then
+    if env -i HOME="$HOME_DIR" PATH="$PATH" TMPDIR="$HOME_DIR" /usr/bin/python3 -I "$GMAIL" version > /dev/null 2>&1; then printf 'gmail runs\n'; else printf 'gmail does not run\n'; bad=1; fi
+  else
+    printf 'gmail provider not installed (fine if you only use HEY)\n'
+  fi
+  k="$HOME_DIR/selftest.key"
+  head -c 32 /dev/urandom > "$k"
+  if printf 'selftest' | "$SEAL" "$k" | "$SEAL" --check "$k" > /dev/null; then
+    printf 'seal round trip works\n'
+  else
+    printf 'seal round trip failed\n'
+    bad=1
+  fi
+  shred_path "$k"
+  [[ "$bad" -eq 0 ]]
+}
+
+verb="${1:-}"
+shift || true
+case "$verb" in
+  state) verb_state ;;
+  open) verb_open "$@" ;;
+  run) verb_run "$@" ;;
+  save) verb_save "$@" ;;
+  keyhash) verb_keyhash ;;
+  close) verb_close ;;
+  stop) verb_stop ;;
+  wipe) verb_wipe ;;
+  selftest) verb_selftest ;;
+  *) die "unknown verb: ${verb:-none}" 64 ;;
+esac
