@@ -395,7 +395,7 @@ def _term(value):
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def build_query(query=None, from_=None, to=None, date=None):
+def build_query(query=None, from_=None, to=None, date=None, words=None):
     parts = []
     if from_:
         parts.append("from:" + _term(from_))
@@ -403,6 +403,10 @@ def build_query(query=None, from_=None, to=None, date=None):
         parts.append("to:" + _term(to))
     if query and query.strip():
         parts.append(_term(query))
+    # Each --word is its own term, so they all must appear (not as a phrase).
+    for w in words or []:
+        if w and w.strip():
+            parts.append(_term(w))
     if date:
         m = {"last_7_days": "newer_than:7d", "last_30_days": "newer_than:30d",
              "last_90_days": "newer_than:90d"}
@@ -444,7 +448,7 @@ def emit(data):
 # ---------------------------------------------------------------- commands
 
 def cmd_search(a):
-    q = build_query(a.query, a.from_, a.to, a.date)
+    q = build_query(a.query, a.from_, a.to, a.date, a.word)
     threads = collect("/threads", "threads", {"q": q}, a.all, a.page)
     out = []
     for t in threads:
@@ -762,6 +766,8 @@ def build_parser():
     s.add_argument("query", nargs="?", help="free-text query")
     s.add_argument("--from", dest="from_", metavar="ADDR")
     s.add_argument("--to", metavar="ADDR")
+    s.add_argument("--word", action="append", default=[], metavar="WORD",
+                   help="a word that must appear (repeatable)")
     s.add_argument("--date", metavar="RANGE",
                    help="last_7_days, last_30_days, last_90_days or YYYY")
     s.add_argument("--all", action="store_true",

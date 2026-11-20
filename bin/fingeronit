@@ -31,7 +31,7 @@ TOUCH="$BIN/finger-touch"
 LIVE="$ROOT/var/live"
 INSTANCES="$ROOT/var/instances"
 DEFAULT_NAME="temp"
-FINGERONIT_VERSION="0.1.0"
+FINGERONIT_VERSION="0.2.0"
 SELF_MTIME="$(stat -f %m "$BIN/fingeronit" 2>/dev/null || printf 0)"
 EXAMPLE_SENDER="news@example.com"
 EXPORT_AUTO=0
@@ -56,12 +56,16 @@ CAUGHT=""
 ASKING=0
 ASK_CANCEL=0
 SECURITY="/usr/bin/security"
+JOB_PY="$ROOT/lib/job.py"
+DESK_DIR="/private/tmp/fingeronit-desk.$(id -u)"
+TOUCH_CODE=""
 # The test harness copies fingeronit to /tmp/fingeronit-ux.* and may swap in stubs.
 # ROOT is a physical path, so only a real copy living there gets the stubs,
 # never your own install reached through a symlink.
 case "$ROOT" in
   /tmp/fingeronit-ux.*|/private/tmp/fingeronit-ux.*)
     [[ -n "${FINGERONIT_SECURITY:-}" ]] && SECURITY="$FINGERONIT_SECURITY"
+    [[ -n "${FINGERONIT_DESK_DIR:-}" ]] && DESK_DIR="$FINGERONIT_DESK_DIR"
     ;;
 esac
 
@@ -593,6 +597,7 @@ clear_live() {
   shred_path "$LIVE/tmp"
   shred_path "$LIVE/runtime"
   shred_path "$LIVE/pack"
+  shred_path "$LIVE/desk"
   shred_path "$LIVE/zdot"
   shred_path "$LIVE/key"
   shred_path "$LIVE/instance"
@@ -631,6 +636,7 @@ cleanup() {
   trap - EXIT INT TERM HUP
   picker_restore
   close_door || status=1
+  desk_close || true
   exports_farewell || true
   exit "$status"
 }
@@ -813,10 +819,27 @@ run_offline() {
   return "$status"
 }
 
+# Four letters, shown in your terminal and in the Touch ID prompt. Any program
+# running as you can raise a Touch ID prompt with any words in it, but it
+# cannot see your terminal, so it cannot show the code you are looking at.
+touch_code_new() {
+  local alphabet="ACDEFHJKMNPRTVWXY34679" c
+  TOUCH_CODE=""
+  for c in $(od -An -tu1 -N4 /dev/urandom); do
+    TOUCH_CODE="$TOUCH_CODE${alphabet:$((c % ${#alphabet})):1}"
+  done
+}
+
 # finger-touch opens the seal after Touch ID and pipes it into the keeper. An
 # older finger-touch without unseal-stream writes two files here first.
 open_sealed() {
   local name="$1" reason="$2" dir r c k hash status=0 tstat=""
+  if [[ -z "$TOUCH_CODE" ]]; then
+    touch_code_new
+    reason="[$TOUCH_CODE] $reason"
+  fi
+  { printf 'Touch ID code %s. Approve only a prompt that shows it.\n' "$TOUCH_CODE" > /dev/tty; } 2> /dev/null || true
+  TOUCH_CODE=""
   dir="$(instance_dir "$name")"
   [[ -f "$dir/sealed.box" ]] || { fail "instance $name has no seal. Sign in first." || return $?; }
   if ! keeper_installed; then
@@ -897,6 +920,10 @@ password), and nowhere else. Each instance is one provider.
                                    every thread from A or B, straight through
   fingeronit --autopilot-test          export every thread from the example sender
                                    in the past 14 days as md and pdf, then open it
+  fingeronit desk [name]               let agents ask: each request shows its purpose
+                                   and lookups, you approve with Touch ID, the door
+                                   shuts, you see the results, then decide to send
+  fingeronit ask --help                for agents: how to ask for one narrow lookup
   fingeronit seal-live                 put a crashed session back in the seal
   fingeronit destroy [name]            delete that instance and its key
   fingeronit destroy --all             delete every instance, the key, and the binary
@@ -3113,6 +3140,355 @@ cmd_export_flags() {
 # folders in /tmp. With no door open anywhere, none of it belongs to anyone,
 # so it is shredded on the way in. /tmp is shared with other fingeronit copies, so
 # a folder there must be an hour old and in use by no process.
+# ---- agents: ask and desk ---------------------------------------------------
+# An agent never opens the door. It runs `fingeronit ask` with one narrow
+# request (lib/job.py says what narrow means). The request waits in a queue
+# until you, at `fingeronit desk` in your own Terminal, read it and approve it
+# with Touch ID. The desk opens the door for that request alone, runs only the
+# searches the request turns into, shuts the door, shows you what came back,
+# and sends it only when you say so. One approval answers one request.
+
+job_py() { "$PYTHON3" -I "$JOB_PY" "$@"; }
+
+desk_dir_ok() {
+  local d="$1" st
+  [[ -d "$d" && ! -L "$d" ]] || return 1
+  st="$(stat -f '%u %Lp' "$d" 2>/dev/null)" || return 1
+  [[ "$st" == "$(id -u) 700" ]]
+}
+
+desk_alive() {
+  local line pid started
+  line="$(head -n 1 "$DESK_DIR/desk.pid" 2>/dev/null || true)"
+  pid="${line%% *}"
+  started="${line#* }"
+  [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$line" ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  [[ "$(proc_started "$pid")" == "$started" ]]
+}
+
+cmd_ask_help() {
+  cat <<EOF
+fingeronit ask — for agents. Ask your human for one narrow mail lookup.
+
+  fingeronit ask --purpose "SENTENCE" (--from ADDR | --to ADDR) --about "WORDS"
+                 --days N [--max N] [--read] [--then ...next lookup...]
+                 [--check] [--wait SECONDS]
+  fingeronit ask --json < request.json
+
+Every lookup names one full address, one to six words about the topic, and a
+time window. --from is mail that address sent; --to is mail sent to it. You get
+up to --max threads (default 3): date, sender and subject, plus the text with
+--read. --then starts another lookup in the same request (3 at most), for the
+same purpose. Your human sees the purpose and every lookup, approves with Touch
+ID, sees what matched, and decides whether it goes to you. Attachments never do.
+
+--check only checks the request and prints what your human would read.
+--wait is how long to wait for them (default 600 seconds).
+
+Refused: no purpose, a purpose that asks for everything, a domain or wildcard
+instead of an address, filler words like "all" or "email", search operators,
+more days or threads than lockenv.cfg allows (90 days, 5 threads by default).
+
+JSON form: {"purpose": "...", "lookups": [{"from": "a@example.com",
+  "about": ["invoice", "4471"], "days": 30, "max": 2, "want": "read"}]}
+
+Exit codes: 0 sent, 2 refused, 3 your human said no, 4 the lookup failed,
+75 no desk is open (ask your human to run: fingeronit desk), 124 timed out.
+The answer is JSON on stdout.
+EOF
+}
+
+ask_out() {
+  printf '{"ok": false, "error": "%s"}\n' "$1"
+  return "$2"
+}
+
+cmd_ask() {
+  local wait=600 check_only=0 from_json=0 req job id out st=0 t=0 code
+  local -a rest=()
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      -h|--help) cmd_ask_help; return 0 ;;
+      --wait)
+        [[ "${2:-}" =~ ^[0-9]{1,4}$ && "$2" -ge 1 && "$2" -le 3600 ]] || { ask_out "--wait takes 1 to 3600 seconds" 2; return; }
+        wait="$2"
+        shift 2
+        ;;
+      --check) check_only=1; shift ;;
+      --json) from_json=1; shift ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+  [[ -f "$JOB_PY" ]] || { ask_out "lib/job.py is missing" 4; return; }
+  set +e
+  if [[ "$from_json" -eq 1 ]]; then
+    [[ "${#rest[@]}" -eq 0 ]] || { set -e; ask_out "--json reads the whole request from stdin; give no other flags" 2; return; }
+    req="$(head -c 65537)"
+  else
+    req="$(job_py from-args ${rest[@]+"${rest[@]}"})"
+    st=$?
+    if [[ "$st" -ne 0 ]]; then
+      set -e
+      printf '%s\n' "$req"
+      return 2
+    fi
+  fi
+  job="$(printf '%s' "$req" | job_py check "$ROOT/lockenv.cfg")"
+  st=$?
+  set -e
+  if [[ "$st" -ne 0 ]]; then
+    printf '%s\n' "$job"
+    return 2
+  fi
+  if [[ "$check_only" -eq 1 ]]; then
+    printf 'Allowed. Your human would read:\n\n'
+    printf '%s' "$job" | job_py describe "$ROOT/lockenv.cfg"
+    printf '\nNothing was sent. Run it again without --check to ask.\n'
+    return 0
+  fi
+  if ! desk_dir_ok "$DESK_DIR" || ! desk_alive || [[ ! -d "$DESK_DIR/in" || -L "$DESK_DIR/in" ]]; then
+    ask_out "no desk is open. Ask your human to run: fingeronit desk (in their own Terminal), then ask again." 75
+    return
+  fi
+  id="$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')"
+  # The desk checks the request again from scratch: what it shows you is what
+  # it re-read, not what this side says it checked.
+  printf '{"waiter": %s, "job": %s}\n' "$$" "$req" > "$DESK_DIR/in/.$id.tmp"
+  mv -f "$DESK_DIR/in/.$id.tmp" "$DESK_DIR/in/$id.json"
+  printf 'fingeronit: asked your human (request %s). Waiting up to %ss for them to approve it with Touch ID.\n' "${id:0:6}" "$wait" >&2
+  out="$DESK_DIR/out/$id.json"
+  while [[ ! -f "$out" ]]; do
+    if [[ "$t" -ge "$wait" ]]; then
+      rm -f "$DESK_DIR/in/$id.json"
+      ask_out "no answer in ${wait}s. Your human may be away; ask again later." 124
+      return
+    fi
+    if ! desk_alive; then
+      rm -f "$DESK_DIR/in/$id.json"
+      ask_out "the desk closed before answering. Ask your human to run: fingeronit desk" 75
+      return
+    fi
+    sleep 1
+    t=$((t + 1))
+  done
+  code="$(head -n 1 "$out")"
+  tail -n +2 "$out"
+  rm -f "$out"
+  [[ "$code" =~ ^[0-9]+$ ]] || code=4
+  return "$code"
+}
+
+DESK_ON=0
+DESK_NAME=""
+DESK_ANSWER=""
+
+desk_open() {
+  if [[ -e "$DESK_DIR" || -L "$DESK_DIR" ]]; then
+    desk_dir_ok "$DESK_DIR" || die "$DESK_DIR must be a folder only you can open (mode 700, not a link). Remove it and try again."
+  else
+    mkdir -m 700 "$DESK_DIR" || die "could not make $DESK_DIR"
+    desk_dir_ok "$DESK_DIR" || die "$DESK_DIR is not yours alone"
+  fi
+  if desk_alive; then
+    die "a desk is already open (pid $(head -n 1 "$DESK_DIR/desk.pid" | cut -d' ' -f1)). Use that window."
+  fi
+  local sub
+  for sub in in out; do
+    [[ ! -L "$DESK_DIR/$sub" ]] || die "$DESK_DIR/$sub is a link. Remove it and try again."
+    mkdir -p "$DESK_DIR/$sub"
+    chmod 700 "$DESK_DIR/$sub"
+  done
+  # Answers nobody collected are mail. They do not outlive the desk that wrote them.
+  find "$DESK_DIR/out" -type f -exec /bin/rm -f {} + 2>/dev/null || true
+  printf '%s %s\n' "$$" "$(proc_started "$$")" > "$DESK_DIR/desk.pid"
+  DESK_ON=1
+}
+
+desk_close() {
+  [[ "${DESK_ON:-0}" -eq 1 ]] || return 0
+  DESK_ON=0
+  rm -f "$DESK_DIR/desk.pid"
+  local f
+  for f in "$DESK_DIR"/out/* "$DESK_DIR"/out/.* "$DESK_DIR"/in/* "$DESK_DIR"/in/.*; do
+    [[ -f "$f" ]] && shred_path "$f"
+  done
+  return 0
+}
+
+# Old answers that no agent picked up within ten minutes are shredded.
+desk_sweep_out() {
+  local f
+  while IFS= read -r -d '' f; do
+    shred_path "$f"
+  done < <(find "$DESK_DIR/out" -type f -mmin +10 -print0 2>/dev/null)
+}
+
+desk_reply() {
+  local id="$1" code="$2" body="$3" tmp
+  [[ -d "$DESK_DIR/out" && ! -L "$DESK_DIR/out" ]] || return 0
+  tmp="$DESK_DIR/out/.$id.tmp"
+  { printf '%s\n' "$code"; printf '%s\n' "$body"; } > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$DESK_DIR/out/$id.json"
+}
+
+desk_waiting() {
+  printf '\nWaiting for agent requests on %s (%s). q closes the desk.\n' "$DESK_NAME" "$(provider_title)"
+}
+
+desk_next() {
+  ls -1tr "$DESK_DIR/in" 2>/dev/null | grep -E '^[0-9a-f]{16}\.json$' | head -n 1 || true
+}
+
+# Open the door for one approved request, run its searches, shut the door.
+# What comes back waits in DESK_ANSWER until you decide.
+desk_run() {
+  local name="$1" job="$2" work reason n i st line tid at rest want
+  local -a sargs
+  work="$LIVE/desk"
+  DESK_ANSWER=""
+  acquire "$name" || return 1
+  mkdir -p "$work"
+  chmod 700 "$work"
+  printf '%s' "$job" > "$work/job.json"
+  touch_code_new
+  reason="$(printf '%s' "$job" | job_py reason "$TOUCH_CODE")"
+  set +e
+  open_sealed "$name" "$reason"
+  st=$?
+  set -e
+  if [[ "$st" -ne 0 ]]; then
+    shred_path "$work"
+    close_door || exit 1
+    printf 'fingeronit: the door stayed shut.\n' >&2
+    return 1
+  fi
+  n="$(printf '%s' "$job" | job_py count)"
+  i=0
+  while [[ "$i" -lt "$n" ]]; do
+    sargs=()
+    while IFS= read -r line; do
+      sargs+=("$line")
+    done < <(printf '%s' "$job" | job_py args "$PROVIDER" "$i")
+    set +e
+    run_hey mail search "${sargs[@]}" --json > "$work/s$i.json" 2> /dev/null
+    st=$?
+    set -e
+    if [[ "$st" -ne 0 ]] || ! job_py pick "$work/job.json" "$i" < "$work/s$i.json" > "$work/l$i.tsv"; then
+      printf 'ERROR\n' > "$work/l$i.tsv"
+    fi
+    shred_path "$work/s$i.json"
+    want="$(printf '%s' "$job" | job_py want "$i")"
+    if [[ "$want" == read ]]; then
+      while IFS=$'\t' read -r -u 4 tid at rest; do
+        [[ -n "$at" && "$tid" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || continue
+        run_hey mail thread read "$tid" --markdown > "$work/t${i}_$tid.md" 2> /dev/null \
+          || shred_path "$work/t${i}_$tid.md"
+      done 4< "$work/l$i.tsv"
+    fi
+    i=$((i + 1))
+  done
+  DESK_ANSWER="$(job_py answer "$work/job.json" "$work" "$ROOT/lockenv.cfg")" || DESK_ANSWER=""
+  shred_path "$work"
+  close_door || exit 1
+  printf 'The door is shut again.\n'
+  [[ -n "$DESK_ANSWER" ]]
+}
+
+desk_take() {
+  local file="$DESK_DIR/in/$1" id="${1%.json}" raw waiter req job st yn
+  raw="$(head -c 70000 "$file" 2> /dev/null || true)"
+  rm -f "$file"
+  waiter="$(printf '%s' "$raw" | "$PYTHON3" -I -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+w = d.get("waiter") if isinstance(d, dict) else None
+print(w if isinstance(w, int) and not isinstance(w, bool) else "")' 2> /dev/null || true)"
+  # Nobody is waiting for it any more: drop it unseen.
+  [[ "$waiter" =~ ^[0-9]+$ ]] && kill -0 "$waiter" 2> /dev/null || return 0
+  req="$(printf '%s' "$raw" | "$PYTHON3" -I -c 'import json,sys; print(json.dumps(json.load(sys.stdin).get("job")))' 2> /dev/null || printf 'null')"
+  set +e
+  job="$(printf '%s' "$req" | job_py check "$ROOT/lockenv.cfg")"
+  st=$?
+  set -e
+  if [[ "$st" -ne 0 ]]; then
+    desk_reply "$id" 2 "$job"
+    printf '\nRefused a request that broke the rules. The agent was told why.\n'
+    desk_waiting
+    return 0
+  fi
+  printf '\n\033[1mAn agent asks:\033[0m\n'
+  printf '%s' "$job" | job_py describe "$ROOT/lockenv.cfg"
+  printf '\n'
+  yn=""
+  ask yn "Approve with Touch ID? [y/N] " || yn=""
+  if [[ "$yn" != y && "$yn" != Y && "$yn" != yes ]]; then
+    desk_reply "$id" 3 '{"ok": false, "error": "your human said no"}'
+    audit "$DESK_NAME" desk said-no "$(printf '%s' "$job" | job_py reason -)"
+    printf 'Said no. The agent was told.\n'
+    desk_waiting
+    return 0
+  fi
+  audit "$DESK_NAME" desk approved "$(printf '%s' "$job" | job_py reason -)"
+  if ! desk_run "$DESK_NAME" "$job"; then
+    desk_reply "$id" 4 '{"ok": false, "error": "the lookup did not run (Touch ID cancelled, or the mail service failed)"}'
+    desk_waiting
+    return 0
+  fi
+  printf '\n\033[1mThis is what would go to the agent:\033[0m\n'
+  printf '%s' "$DESK_ANSWER" | job_py review
+  printf '\n'
+  yn=""
+  ask yn "Send this to the agent? [y/N] " || yn=""
+  if [[ "$yn" == y || "$yn" == Y || "$yn" == yes ]]; then
+    desk_reply "$id" 0 "$DESK_ANSWER"
+    audit "$DESK_NAME" desk sent
+    printf 'Sent.\n'
+  else
+    desk_reply "$id" 3 '{"ok": false, "error": "your human looked at the results and kept them"}'
+    audit "$DESK_NAME" desk withheld
+    printf 'Kept. The agent got nothing.\n'
+  fi
+  DESK_ANSWER=""
+  desk_waiting
+}
+
+cmd_desk() {
+  local name="$1" f key
+  require_tty
+  need_name "$name"
+  provider_load "$name"
+  need_tools
+  [[ -f "$JOB_PY" ]] || die "lib/job.py is missing"
+  [[ -f "$(instance_dir "$name")/sealed.box" ]] || die "instance $name has no seal. Sign in first: fingeronit login"
+  DESK_NAME="$name"
+  desk_open
+  IN_MENU=1
+  printf '\033[1mfingeronit desk\033[0m: agents can ask; only you can approve.\n'
+  printf 'Each request shows its purpose and lookups. y then Touch ID runs it; the door\n'
+  printf 'shuts straight after, and you see the results before the agent does.\n'
+  printf 'A Touch ID prompt that appears without you pressing y here is not from this desk: cancel it.\n'
+  desk_waiting
+  while true; do
+    desk_sweep_out
+    f="$(desk_next)"
+    if [[ -n "$f" ]]; then
+      desk_take "$f"
+      continue
+    fi
+    key=""
+    IFS= read -r -s -n 1 -t 1 key < /dev/tty || true
+    case "$key" in
+      q|Q) break ;;
+    esac
+  done
+  desk_close
+  printf 'Desk closed. Agents cannot ask until you open it again.\n'
+}
+
 sweep_tmp_leftovers() {
   local p me
   me="$(id -u)"
@@ -3170,7 +3546,7 @@ main() {
       ;;
   esac
   case "${1:-menu}" in
-    menu|export|--autopilot-test|session|run|login|clean)
+    menu|export|--autopilot-test|session|run|login|clean|desk)
       sweep_abandoned
       ;;
   esac
@@ -3194,6 +3570,8 @@ main() {
     clean-old) cmd_clean_old ;;
     clean) printf 'Nothing else is left over from earlier sessions.\n' ;;
     login) cmd_login "$@" ;;
+    ask) cmd_ask "$@" ;;
+    desk) cmd_desk "${1:-$DEFAULT_NAME}" ;;
     session) cmd_session "${1:-$DEFAULT_NAME}" ;;
     seal-live) cmd_seal_live ;;
     doctor) cmd_doctor "${1:-$DEFAULT_NAME}" ;;

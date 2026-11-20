@@ -17,6 +17,7 @@ case "$UXHOME" in /tmp/fingeronit-ux-home.*) ;; *) exit 1 ;; esac
 export HOME="$UXHOME"
 export FINGERONIT_KEEPER_LOCAL=1
 export FINGERONIT_SECURITY="$UXHOME/security-stub"
+export FINGERONIT_DESK_DIR="$UXHOME/desk"
 cat > "$FINGERONIT_SECURITY" << EOF
 #!/bin/bash
 # Stub keychain. The marker file stands for one item under service "hey".
@@ -373,6 +374,7 @@ make_root() {
   mkdir -p "$ROOT/bin" "$ROOT/lib/providers" "$ROOT/libexec" "$ROOT/var/live" "$ROOT/var/instances"
   cp "$SRC" "$ROOT/bin/fingeronit"
   cp "$KEEPER_SRC" "$ROOT/lib/keeper"
+  cp "$HERE/../lib/job.py" "$ROOT/lib/job.py"
   chmod 700 "$ROOT/lib/keeper"
   chmod 700 "$ROOT/bin/fingeronit"
   ln -s bin/fingeronit "$ROOT/fingeronit"
@@ -1331,6 +1333,130 @@ def gmail_session(root):
     code, all_text = drive(root, [], steps, 40)
     must(code == 0, "gmail session exit %s" % code)
 
+GOOD = ["--purpose", "Find the alpha note News sent me last week", "--from", "news@example.com",
+        "--about", "alpha", "--days", "30"]
+
+def ask_cmd(root, *args, wait=True, stdin=None):
+    import subprocess
+    p = subprocess.Popen([os.path.join(root, "fingeronit"), "ask", *args],
+                         stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    if not wait:
+        return p
+    out, err = p.communicate(input=stdin.encode() if stdin is not None else None, timeout=30)
+    return p.returncode, out.decode(), err.decode()
+
+def desk(root):
+    import json
+    ddir = os.environ["FINGERONIT_DESK_DIR"]
+    # No desk open: the agent is told to ask its human, nothing waits.
+    code, out, _ = ask_cmd(root, *GOOD)
+    must(code == 75 and "no desk is open" in out, "ask without a desk: %s %s" % (code, out))
+    # Shapes that are refused before anyone is asked.
+    refused = [
+        (["--purpose", "Show me all emails ever sent to me", "--from", "news@example.com",
+          "--about", "alpha", "--days", "30"], "asks for too much"),
+        (["--purpose", "Find the alpha note News sent me", "--from", "*@example.com",
+          "--about", "alpha", "--days", "30"], "full email address"),
+        (["--purpose", "Find the alpha note News sent me", "--from", "example.com",
+          "--about", "alpha", "--days", "30"], "full email address"),
+        (["--purpose", "Find the alpha note News sent me", "--from", "news@example.com",
+          "--days", "30"], "say what it is about"),
+        (["--purpose", "Find the alpha note News sent me", "--from", "news@example.com",
+          "--about", "all subjects", "--days", "30"], "says nothing about the topic"),
+        (["--purpose", "Find the alpha note News sent me", "--from", "news@example.com",
+          "--about", "alpha"], "--days N is required"),
+        (["--purpose", "Find the alpha note News sent me", "--from", "news@example.com",
+          "--about", "alpha", "--days", "3000"], "--days must be 1 to 90"),
+        (["--purpose", "Find the alpha note News sent me", "--from", "news@example.com",
+          "--about", "alpha", "--days", "30", "--max", "50"], "--max must be 1 to 5"),
+        (["--purpose", "Find the alpha note News sent me", "--from", "news@example.com",
+          "--about", "in:anywhere", "--days", "30"], "plain word"),
+        (["--purpose", "Find the alpha note News sent me", "--from", "news@example.com",
+          "--about", "alpha OR beta", "--days", "30"], "no search operators"),
+        (GOOD + ["--", "box", "list"], "unknown flag"),
+        (["--purpose", "short", "--from", "news@example.com", "--about", "alpha", "--days", "30"],
+         "too short"),
+    ]
+    for args, why in refused:
+        code, out, _ = ask_cmd(root, *args)
+        must(code == 2 and why in out, "ask was not refused for %r: %s %s" % (why, code, out))
+    many = GOOD + ["--then"] + GOOD[2:5] + ["beta", "--days", "9", "--then"] + GOOD[2:5] + \
+        ["gamma", "--days", "8", "--then"] + GOOD[2:5] + ["delta", "--days", "7"]
+    code, out, _ = ask_cmd(root, *many)
+    must(code == 2 and "3 lookups at most" in out, "four lookups were allowed: %s" % out)
+    code, out, _ = ask_cmd(root, "--json", stdin='{"purpose": "Find the alpha note News sent me", '
+                           '"lookups": [{"from": "news@example.com", "about": "alpha", "days": 30, '
+                           '"command": "box list"}]}')
+    must(code == 2 and "unknown field command" in out, "an extra JSON field was allowed: %s" % out)
+    code, out, _ = ask_cmd(root, "--check", *GOOD)
+    must(code == 0 and "Your human would read" in out and "news@example.com" in out,
+         "ask --check: %s %s" % (code, out))
+    must(not os.path.exists(os.path.join(ddir, "in")), "--check queued something")
+
+    state = {}
+    def waiting(root, slice_):
+        must("only you can approve" in slice_ or "Waiting for agent requests" in slice_, "desk banner missing")
+        must(not live_lock(root), "the desk opened the door before a request")
+        state["p"] = ask_cmd(root, *(GOOD + ["--max", "2", "--read"]), wait=False)
+    def shown(root, slice_):
+        must("An agent asks:" in slice_, "the request was not shown")
+        must("Find the alpha note News sent me" in slice_, "the purpose was not shown")
+        must('mail from news@example.com about "alpha", last 30 days, up to 2 threads' in slice_,
+             "the lookup was not shown: " + slice_)
+        must(not live_lock(root), "the door opened before approval")
+    def reviewed(root, slice_):
+        must("Touch ID code " in slice_, "no Touch ID code was shown")
+        must("The door is shut again." in slice_, "the door was not shut before review")
+        must(not live_lock(root) and not live_cred(root), "the door was open during review")
+        must("Alpha note" in slice_, "the matching thread was not shown")
+        for other in ("Beta note", "Gamma note", "Ancient note"):
+            must(other not in slice_, other + " was in the results")
+    def sent(root, slice_):
+        p = state["p"]
+        out, err = p.communicate(timeout=20)
+        must(p.returncode == 0, "ask exit %s: %s %s" % (p.returncode, out, err))
+        text = out.decode()
+        ans = json.loads(text)
+        threads = ans["lookups"][0]["threads"]
+        must([t["id"] for t in threads] == ["111"], "wrong threads went out: %s" % threads)
+        must("stub-thread 111" in threads[0]["text"], "the text did not go out")
+        must("SECRET-BODY" not in text, "search snippets went out")
+        must(not os.listdir(os.path.join(ddir, "out")), "the answer was left behind")
+        log = open(os.path.join(root, "var/instances/temp/audit.log")).read()
+        must("desk approved" in log and "desk sent" in log, "the desk did not audit")
+        state["p"] = ask_cmd(root, *(GOOD[:5] + ["beta", "--days", "30"]), wait=False)
+    def said_no(root, slice_):
+        p = state["p"]
+        out, _ = p.communicate(timeout=20)
+        must(p.returncode == 3 and "said no" in out.decode(), "a no was not passed on: %s" % out)
+        state["p"] = ask_cmd(root, *GOOD, wait=False)
+    def kept(root, slice_):
+        p = state["p"]
+        out, _ = p.communicate(timeout=20)
+        must(p.returncode == 3 and "kept them" in out.decode(), "kept results went out: %s" % out)
+    steps = [
+        {"wait": "Waiting for agent requests", "check": waiting},
+        {"wait": "Approve with Touch ID? [y/N] ", "check": shown, "send": "y\r"},
+        {"wait": "Send this to the agent? [y/N] ", "check": reviewed, "send": "y\r"},
+        {"wait": "Sent."},
+        {"wait": "Waiting for agent requests", "check": sent},
+        {"wait": "Approve with Touch ID? [y/N] ", "send": "n\r"},
+        {"wait": "Said no."},
+        {"wait": "Waiting for agent requests", "check": said_no},
+        {"wait": "Approve with Touch ID? [y/N] ", "send": "y\r"},
+        {"wait": "Send this to the agent? [y/N] ", "send": "\r"},
+        {"wait": "Kept. The agent got nothing."},
+        {"wait": "Waiting for agent requests", "check": kept, "send": "q"},
+        {"wait": "Desk closed."},
+    ]
+    code, text = drive(root, ["desk"], steps, 60)
+    must(code == 0, "desk exit %s" % code)
+    must(not live_lock(root) and seal(root), "the desk left the door open or lost the seal")
+    must(not os.path.exists(os.path.join(ddir, "desk.pid")), "the desk left its pid behind")
+    code, out, _ = ask_cmd(root, *GOOD)
+    must(code == 75, "ask after the desk closed: %s" % code)
+
 if __name__ == "__main__":
     root, name = sys.argv[1], sys.argv[2]
     {"story": story, "signin": signin, "already": already, "setup": setup_refused,
@@ -1341,7 +1467,7 @@ if __name__ == "__main__":
      "farewell": farewell_menu, "clean-old": clean_old, "with": with_mail, "prompts": prompts,
      "hangup": hangup, "orphaned": orphaned, "owned-elsewhere": owned_elsewhere,
      "signin-gmail": signin_gmail, "login-cli": login_cli, "gmail-export": gmail_export,
-     "gmail-session": gmail_session}[name](root)
+     "gmail-session": gmail_session, "desk": desk}[name](root)
 PY
   chmod 700 "$1"
 }
@@ -1435,6 +1561,11 @@ root="$ROOT"
 python3 "$root/drive.py" "$root" signin
 python3 "$root/drive.py" "$root" already
 pass "a second login is refused and the door stays shut"
+make_root
+root="$ROOT"
+python3 "$root/drive.py" "$root" signin
+python3 "$root/drive.py" "$root" desk
+pass "agents: narrow asks only, the human approves each with Touch ID, sees results first"
 
 make_root
 root="$ROOT"

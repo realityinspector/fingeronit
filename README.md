@@ -17,6 +17,7 @@ On a Mac, a mail CLI keeps your login where any program running as you can usual
 - **Terminal only.** A pipe, or a shell with no terminal, is refused.
 - **Out of your user's reach while open** (optional, one `sudo`). A hidden `_fingeronit` user holds the open login, and runs `hey` or `gmail` only for the terminal that opened it.
 - **Shuts itself.** 20 minutes with no keys pressed and the door closes and reseals.
+- **Agents ask, you approve.** An agent can request one narrow lookup with `fingeronit ask`. You see the purpose in `fingeronit desk`, approve it with Touch ID, and see the results before the agent gets them.
 
 ## Quick start
 
@@ -80,6 +81,8 @@ Through the keeper, `gmail` may do only: `search`, `thread read`, `attachment li
 | `fingeronit status` | Provider, seal, door and keeper state. Never unlocks. |
 | `fingeronit doctor` | Checks the hey binary's checksum, the flags fingeronit relies on in each provider, and tools. Skips Gmail with a clear line if `lib/providers/gmail.py` is missing. Never unlocks. Run it after HEY or gmail.py changes. |
 | `fingeronit login [--provider hey\|gmail] [--client FILE] [NAME]` | Sign in. The default instance is `temp`, the default provider `hey`. `--client` is your Google OAuth client file, for Gmail. |
+| `fingeronit desk [NAME]` | Lets agents ask. You approve each request with Touch ID, then choose whether its results go to the agent. |
+| `fingeronit ask ...` | For agents: one narrow lookup, waiting on your approval. `--help` lists the rules. |
 | `fingeronit seal-live` | Puts a crashed session's login back in the seal. |
 | `fingeronit clean` | Shreds scratch that an abandoned session left behind. This also happens on its own at start. |
 | `fingeronit clean-old` | HEY only: removes an older HEY CLI login (`~/.config/hey-cli` and the keychain item `hey`) after you type REMOVE. |
@@ -104,6 +107,54 @@ Without the keeper, an open door is a folder your user owns, so your other progr
 
 Files go to `/usr/local/libexec/fingeronit` (root-owned): the keeper, `hey`, `seal`, and `gmail.py` when `lib/providers/gmail.py` exists. The installer checks the HEY binary against its checksum, has `visudo` check the rule before adding it, and ends with a self-test. Run it again after updating HEY, gmail.py or fingeronit. It runs a script from your own checkout as root, so read it first, and keep the checkout writable only by you.
 
+## Let an agent use it
+
+Point an agent at this repo and say "set it up and use it". The agent can build it, check it, and ask for mail. It can never open the door itself.
+
+1. **The agent sets up:** `bin/build`, then `bin/fingeronit doctor`.
+2. **You sign in once:** `./fingeronit` in your own Terminal. Optionally run `sudo bin/install-keeper`.
+3. **You open the desk:** `./fingeronit desk` in a Terminal window you keep open while the agent works.
+4. **The agent asks:**
+
+   ```sh
+   bin/fingeronit ask --purpose "Find the invoice Acme sent for order 4471" \
+     --from billing@acme.example --about "invoice 4471" --days 30 --max 2 --read
+   ```
+
+5. **You decide, twice.** The desk shows the purpose and each lookup in plain words. `y` raises Touch ID with a four-letter code that the desk also shows. The door opens for that request alone, runs only its searches, and shuts. Then you see each thread's date, sender and subject, and choose whether it goes to the agent.
+6. **The agent gets JSON:** each thread's id, date, sender and subject, plus text with `--read`. Attachments never go to agents.
+
+**What an agent may ask for.** A request is wrapped so it cannot grow:
+
+- **Every lookup is narrow.**
+  - One full address: `--from` (mail they sent) or `--to` (mail sent to them). Domains and wildcards are refused.
+  - One to six words about the topic. Filler such as "all", "email" or "subject", and search operators, are refused.
+  - A time window: `--days`, 90 at most.
+  - A cap: `--max` threads, 5 at most, default 3.
+- **A request holds up to 3 lookups**, chained with `--then`. One fingerprint covers them all, for one stated purpose.
+- **Broad purposes are refused**, such as "all emails", "every subject", "export", "dump" or "ever".
+- **Results are checked, not trusted.** fingeronit keeps only threads that really are from the named address and inside the window. Search snippets are dropped. `--read` text is capped at 20,000 characters for the whole request.
+- **One approval answers one request.** Nothing is cached. The next request needs your finger again.
+- **The limits live in `lockenv.cfg`** (`agent_max_days`, `agent_max_threads`, `agent_max_lookups`, `agent_max_chars`). Settings there can only lower the ceilings built into `lib/job.py`.
+
+`fingeronit ask --check ...` shows what you would read, without asking you. `fingeronit ask --help` lists the rules for the agent.
+
+**Exit codes:**
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Sent. |
+| 2 | Refused: the reason is in the JSON. |
+| 3 | You said no, or kept the results. |
+| 4 | The lookup failed. |
+| 75 | No desk is open. |
+| 124 | Timed out. |
+
+**Know the limit.** fingeronit can stop an agent that only uses `fingeronit ask`. It cannot stop an agent that rewrites fingeronit's own files, or your shell, before you run the desk, because that agent runs as you. Two defenses:
+
+- Run agents in a sandbox that cannot write this folder, such as Claude Code's sandbox, or with this repo outside their writable paths.
+- Cancel any Touch ID prompt that appears when you did not just press `y`, or whose code does not match the one on screen.
+
 ## What it protects, and what it does not
 
 | Protected | Not protected |
@@ -113,6 +164,8 @@ Files go to `/usr/local/libexec/fingeronit` (root-owned): the keeper, `hey`, `se
 | `hey` or `gmail` being run without you: every unlock needs your fingerprint, and names the command. | A Touch ID prompt you approve without reading. Cancel any you did not just ask for. |
 | Injected code skipping Touch ID: `bin/build` signs with the hardened runtime. | Exports, while they exist. Deleted files can survive in Spotlight, Time Machine snapshots, or APFS free space. |
 | Token printing and settings changes through `fingeronit run`. | The audit log under `var/instances`, which records times, senders and commands in plain text. |
+| An agent asking for more than one narrow lookup: `fingeronit ask` refuses it before you are asked, and the desk checks it again. | What you send an agent. Once sent, it is as private as the agent and its logs. |
+| A Touch ID prompt raised by another program: every prompt fingeronit raises shows a four-letter code that is also in your terminal. | An agent that can rewrite fingeronit's files or your shell before you run it. Keep this folder out of its write access. |
 
 This is one padlock, not a regulated control.
 
@@ -132,9 +185,12 @@ If the HEY CLI was set up on this Mac before fingeronit, its login may still be 
 
 If you are an AI agent working in a checkout of this repo, read [`AGENTS.md`](AGENTS.md) first. In short:
 
-- **Do not** run `hey`, `gmail`, `fingeronit`, `finger-touch`, `finger-seal`, `lib/providers/gmail.py`, or anything in `libexec/`.
+- **To get mail,** run `bin/fingeronit ask` (see [Let an agent use it](#let-an-agent-use-it)). Your human approves each request at their desk. Do not ask for more than the task needs.
+- **You may also run** `bin/build`, `bin/fingeronit doctor`, `status`, `version`, `help`, and `ask --help` / `ask --check`.
+- **Do not** run any other `fingeronit` command, or `hey`, `gmail`, `finger-touch`, `finger-seal`, `lib/providers/gmail.py`, or anything in `libexec/`.
 - **Do not** read `var/`, audit logs, sealed files, `~/fingeronit-export`, `~/.config/hey-cli`, or `~/.config/fingeronit-gmail`.
-- **Do not** search, list, or summarize the user's email. If they ask you to fetch mail, tell them which `fingeronit` command to run in their own terminal.
+- **Do not** search or list the user's email any other way, and do not try to widen a request that was refused or said no to.
+- **Do not** edit fingeronit's files in a checkout your human uses for real mail. Develop in a separate clone.
 - **You may** read and edit the source (including `lib/providers/`), and run `bin/ux-test`, which drives the whole menu against stub binaries and a stub Gmail provider, a fake home folder and a fake keychain under `/tmp`. It never touches a real seal or real mail.
 
 | Path | What it is |
@@ -142,6 +198,7 @@ If you are an AI agent working in a checkout of this repo, read [`AGENTS.md`](AG
 | `bin/fingeronit` | The CLI and menu (bash), and the provider table. |
 | `lib/keeper` | Holds an open login; runs `hey` or `gmail.py` only for its ticket (bash). Mirrors the provider table. |
 | `lib/providers/gmail.py` | The Gmail provider: a CLI with the same JSON shapes as `hey`'s, on `/usr/bin/python3`. |
+| `lib/job.py` | The shape of an agent request: checks it, describes it, turns it into searches, filters and trims the results. |
 | `lib/FingerTouch.swift` | Touch ID, the keychain key, seal and unseal. Builds `bin/finger-touch`. |
 | `lib/FingerSeal.swift` | Seals what the keeper holds. Builds `bin/finger-seal`. |
 | `bin/install-keeper` | Creates `_fingeronit`, installs the keeper (and `hey`, `gmail.py`), adds the sudoers rule. |
@@ -150,8 +207,9 @@ If you are an AI agent working in a checkout of this repo, read [`AGENTS.md`](AG
 | `bin/ux-test` | End-to-end test of the menu and exports on stubs, for both providers. |
 | `lib/providers/gmail.py` | The read-only Gmail client (Python, standard library only). |
 | `tests/test_gmail.py` | Its unit tests, against a fake Gmail. |
+| `tests/test_job.py` | Unit tests for the agent request rules. |
 | `docs/gmail.md` | How to make your own Google OAuth client. |
-| `lockenv.cfg` | The pinned HEY release and checksums, and `idle_minutes`. |
+| `lockenv.cfg` | The pinned HEY release and checksums, `idle_minutes`, and the agent limits. |
 | `docs/fingeronit.svg` | The diagram above. |
 | `libexec/hey`, `bin/finger-touch`, `bin/finger-seal` | Built by `bin/build`. Not in git. |
 | `var/` | Seals, audit logs, and the open door when no keeper is installed. Not in git. Never read it. |
